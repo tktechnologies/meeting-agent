@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import re
 
 from . import db
+from . import retrieval
 from .config import DEFAULT_ORG_ID
 
 
@@ -461,12 +462,12 @@ def _bullet_from_fact(fact: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     text = _abstract_text_from_fact(fact, language=lang) or _short_text_from_payload(payload)
     if not text:
         return None
-    if _quality_score(text, lang) < 0.45:
+    if _quality_score(text, lang) < 0.60:
         synth = _keywords_phrase([
             payload.get("subject"), payload.get("title"), payload.get("headline"), payload.get("summary"), payload.get("text")
         ], lang)
         text = _refine_phrase(synth or "", lang) if synth else ""
-        if _quality_score(text, lang) < 0.45:
+        if _quality_score(text, lang) < 0.60:
             return None
     owner = payload.get("owner")
     if not owner:
@@ -488,11 +489,26 @@ def _categorise_candidates(candidates: Sequence[Dict[str, Any]]) -> Dict[str, Li
     buckets: Dict[str, List[Dict[str, Any]]] = {
         title: [] for title, _ in SECTION_TEMPLATES
     }
+    seen_texts: set[str] = set()
+    meeting_meta_count = 0
     for fact in candidates:
         bullet = _bullet_from_fact(fact)
         if not bullet:
             continue
         fact_type = (fact.get("fact_type") or "").lower()
+        # Cap soft/context items to avoid crowding
+        if fact_type == "meeting_metadata":
+            if meeting_meta_count >= 2:
+                continue
+            meeting_meta_count += 1
+
+        # Dedupe by normalized bullet text
+        norm_key = (bullet.get("text") or "").strip().lower().rstrip(" .:;?!")
+        if not norm_key:
+            continue
+        if norm_key in seen_texts:
+            continue
+        seen_texts.add(norm_key)
         placed = False
         for title, accepted in SECTION_TEMPLATES:
             if fact_type in accepted:
@@ -505,24 +521,46 @@ def _categorise_candidates(candidates: Sequence[Dict[str, Any]]) -> Dict[str, Li
 
 
 def _build_sections(buckets: Dict[str, List[Dict[str, Any]]], total_minutes: int) -> List[Dict[str, Any]]:
-    sections = []
-    active = [title for title, items in buckets.items() if items]
+    sections: List[Dict[str, Any]] = []
+    active = [(title, buckets.get(title) or []) for title, _ in SECTION_TEMPLATES if buckets.get(title)]
     if not active:
         return sections
-    minutes_per_section = max(5, int(total_minutes / max(1, len(active))))
+
+    # Weight grows with bullet count but is capped to avoid runaway sections
+    weights = {title: 2 + min(5, len(bullets)) for title, bullets in active}
+    total_weight = sum(weights.values()) or 1
+    MIN = 5
+
+    # Initial allocation (rounded)
+    alloc = {title: max(MIN, int(total_minutes * weights[title] / total_weight)) for title in weights}
+
+    # Adjust rounding drift to match total_minutes exactly
+    drift = total_minutes - sum(alloc.values())
+    keys_by_weight = sorted(weights, key=lambda k: weights[k], reverse=True)
+    while drift != 0:
+        for k in (keys_by_weight if drift > 0 else reversed(keys_by_weight)):
+            if drift == 0:
+                break
+            if drift > 0:
+                alloc[k] += 1
+                drift -= 1
+            else:
+                if alloc[k] > MIN:
+                    alloc[k] -= 1
+                    drift += 1
+
+    # Build sections (keep existing section + items shape)
     for title, _ in SECTION_TEMPLATES:
         bullets = buckets.get(title) or []
         if not bullets:
             continue
         sections.append({
             "title": title,
-            "minutes": minutes_per_section,
-            "items": [
-                {
-                    "heading": title,
-                    "bullets": bullets[:5],
-                }
-            ],
+            "minutes": alloc.get(title, MIN),
+            "items": [{
+                "heading": title,
+                "bullets": bullets[:5],
+            }],
         })
     return sections
 
@@ -537,6 +575,24 @@ def _compute_coverage(buckets: Dict[str, List[Dict[str, Any]]]) -> float:
     return round(0.4 + 0.4 * diversity + 0.2 * density, 2)
 
 
+def _subject_match_score(subject: Optional[str], buckets: Dict[str, List[Dict[str, Any]]], language: str) -> float:
+    if not subject:
+        return 0.0
+    import re
+    subj_toks = {t for t in re.findall(r"\w+", subject.lower()) if len(t) >= 3}
+    if not subj_toks:
+        return 0.0
+    bullet_words: set[str] = set()
+    for items in buckets.values():
+        for b in items:
+            txt = (b.get("text") or "").lower()
+            bullet_words.update(t for t in re.findall(r"\w+", txt) if len(t) >= 3)
+    if not bullet_words:
+        return 0.0
+    overlap = len(subj_toks & bullet_words)
+    return 0.0 if not subj_toks else round(overlap / len(subj_toks), 3)
+
+
 def plan_agenda(
     org_id: str,
     subject: Optional[str],
@@ -549,6 +605,7 @@ def plan_agenda(
     buckets = _categorise_candidates(candidates)
     sections = _build_sections(buckets, duration_minutes)
     coverage = _compute_coverage(buckets)
+    subj_match = _subject_match_score(subject, buckets, language)
     title = "Reunião" if language == "pt-BR" else "Meeting"
     agenda = {
         "title": title,
@@ -556,7 +613,7 @@ def plan_agenda(
         "sections": sections,
     }
     choice = "subject" if subject else "default"
-    reason = "subject coverage" if subject and coverage >= 0.5 else "default template"
+    reason = "forward-looking heuristics"
     supporting_fact_ids = [fact.get("fact_id") for fact in candidates if fact.get("fact_id")]
     proposal = {
         "agenda": agenda,
@@ -565,6 +622,7 @@ def plan_agenda(
         "subject": {
             "query": subject,
             "coverage": coverage,
+            "match": subj_match,
             "facts": len(candidates),
         },
         "supporting_fact_ids": supporting_fact_ids,
@@ -582,15 +640,50 @@ def plan_agenda_next(
     language: str = "en-US",
 ) -> Dict[str, Any]:
     org_id = org_id or DEFAULT_ORG_ID
+    # Rescue: if subject is missing or low-quality, infer and polish it
+    def _is_low_quality(s: Optional[str]) -> bool:
+        if not s or not s.strip():
+            return True
+        ss = s.strip()
+        # reuse retrieval’s generic check + a light quality gate
+        if retrieval.looks_generic_subject(ss, language):
+            return True
+        # Borrow the phrase quality heuristic from this module
+        return (_quality_score(ss, language) < 0.55)
+
+    if _is_low_quality(subject):
+        inferred = retrieval.infer_best_subject(org_id, language=language)
+        if inferred and not _is_low_quality(inferred):
+            subject = inferred
+
+    # If we have a (now good) subject, always go subject-centered and RAG on it
+    if subject:
+        subj_candidates = retrieval.retrieve_facts_for_subject(org_id, subject, limit=60, language=language)
+        return _plan_agenda_subject_centered(
+            org_id, subject, subj_candidates,
+            company_context=company_context, duration_minutes=duration_minutes, language=language
+        )
+
+    # Fallback: legacy next-meeting flow (unchanged)
     buckets = _derive_next_bullets(candidates, language)
     buckets = _fill_core_sections(buckets, language)
+    # Sort bullets within each section by due date (earlier first), then text
+    from datetime import datetime
+
+    def _sort_key(b):
+        due = (b.get("due") or "").strip()
+        # items with due dates first; simple lexical works for ISO strings
+        return (0 if due else 1, due, (b.get("text") or ""))
+
+    for key, items in list(buckets.items()):
+        buckets[key] = sorted(items, key=_sort_key)
     sections = _build_sections_next(buckets, duration_minutes, language, company_context)
     # Simple coverage proxy
     coverage = 1.0 if sections else 0.0
     title = "Reunião" if language == "pt-BR" else "Meeting"
     agenda = {"title": title, "minutes": duration_minutes, "sections": sections}
     choice = "next" if subject else "next-default"
-    reason = "forward-looking heuristics"
+    reason = "subject coverage" if subject and coverage >= 0.5 and subj_match >= 0.5 else "default template"
     supporting_fact_ids = [fact.get("fact_id") for fact in candidates if fact.get("fact_id")]
     return {
         "agenda": agenda,
@@ -598,6 +691,69 @@ def plan_agenda_next(
         "reason": reason,
         "subject": {"query": subject, "coverage": coverage, "facts": len(candidates)},
         "supporting_fact_ids": supporting_fact_ids,
+    }
+
+
+def _plan_agenda_subject_centered(
+    org_id: str,
+    subject: str,
+    candidates: Sequence[Dict[str, Any]],
+    *,
+    company_context: Optional[str],
+    duration_minutes: int,
+    language: str,
+) -> Dict[str, Any]:
+    # Build forward-looking buckets from subject-specific candidates
+    buckets = _derive_next_bullets(candidates, language)
+    buckets = _fill_core_sections(buckets, language)
+    # If no bullets at all, fall back to legacy next-meeting derivation using broad candidates
+    total_bullets = sum(len(v) for v in buckets.values())
+    if total_bullets == 0:
+        broad = retrieval.find_candidates_for_agenda(org_id, None, DEFAULT_FACT_TYPES, limit=60)
+        buckets = _derive_next_bullets(broad, language)
+        buckets = _fill_core_sections(buckets, language)
+    # Allocate sections with existing next-meeting allocator (may include Company Context)
+    sections = _build_sections_next(buckets, duration_minutes, language, company_context)
+    # Note: sections may exist even with empty items; our bullet-count fallback above addresses emptiness
+    # Prepend a Goal section and a short Why section if possible
+    goal_title = "Meta" if language == "pt-BR" else "Goal"
+    why_title = "Contexto" if language == "pt-BR" else "Why"
+    goal_sec = {
+        "title": goal_title,
+        "minutes": max(5, int(duration_minutes * 0.12)),
+        "items": [{"heading": goal_title, "bullets": [{"text": subject}]}],
+    }
+    # Build a compact why from evidence snippets or company context
+    why_bullets: List[Dict[str, Any]] = []
+    # prefer evidence quotes to justify subject selection
+    added = 0
+    for fact in candidates:
+        for ev in (fact.get("evidence") or [])[:1]:
+            q = ev.get("quote")
+            if isinstance(q, str) and q.strip():
+                why_bullets.append({"text": q.strip()[:180] + ("…" if len(q.strip()) > 180 else "")})
+                added += 1
+                if added >= 2:
+                    break
+        if added >= 2:
+            break
+    if not why_bullets and company_context and company_context.strip():
+        why_bullets.append({"text": company_context.strip()})
+    if why_bullets:
+        why_sec = {"title": why_title, "minutes": 5, "items": [{"heading": why_title, "bullets": why_bullets}]}
+        sections = [goal_sec, why_sec] + sections
+    else:
+        sections = [goal_sec] + sections
+    # Compose proposal
+    title = "Reunião" if language == "pt-BR" else "Meeting"
+    agenda_obj = {"title": title, "minutes": duration_minutes, "sections": sections}
+    supporting = [fact.get("fact_id") for fact in candidates if fact.get("fact_id")]
+    return {
+        "agenda": agenda_obj,
+        "choice": "next-subject",
+        "reason": "subject-focused forward plan",
+        "subject": {"query": subject, "coverage": 1.0 if sections else 0.0, "facts": len(candidates)},
+        "supporting_fact_ids": supporting,
     }
 
 

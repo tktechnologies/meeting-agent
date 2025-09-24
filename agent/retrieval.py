@@ -4,6 +4,7 @@ import re
 
 from .config import DEFAULT_ORG_ID
 from . import db
+from . import auto_validate
 
 
 Candidate = Dict[str, Any]
@@ -57,6 +58,14 @@ def find_candidates_for_agenda(
     limit: int = 60,
 ) -> List[Candidate]:
     org_id = org_id or DEFAULT_ORG_ID
+    # Opportunistic auto-validation pass: if there are draft/proposed facts, try to validate a few
+    try:
+        recent = db.get_recent_facts(org_id, types, limit=60)
+        if any(str(r["status"] or "").lower() in {"draft", "proposed"} for r in recent):
+            auto_validate.validate_org_if_needed(org_id, types)
+    except Exception:
+        # non-fatal: continue if auto-validate fails
+        pass
     # Primary: subject search (FTS/LIKE)
     rows = db.search_facts(org_id, subject or "", types, limit) if subject else None
     # Fallback 1: tokenized FTS OR search
@@ -76,6 +85,9 @@ def find_candidates_for_agenda(
     # Fallback 2: recent facts
     if not rows:
         rows = db.get_recent_facts(org_id, types, limit)
+    # Keep only vetted facts for agenda planning
+    if rows:
+        rows = [r for r in rows if (str(r["status"] or "").lower() in {"validated", "published"})]
     # Diversify: ensure we have some of each core category to help build sections
     if rows:
         got = {r["fact_type"].lower() for r in rows if r["fact_type"]}
@@ -86,6 +98,8 @@ def find_candidates_for_agenda(
         for t, extra in core_needs:
             if t not in got:
                 extra_rows = db.get_recent_facts(org_id, [t], extra)
+                # filter augmented rows to vetted statuses only
+                extra_rows = [er for er in extra_rows if (str(er["status"] or "").lower() in {"validated", "published"})]
                 augmented.extend(extra_rows)
         # De-duplicate by fact_id preserving order
         seen = set()
@@ -126,7 +140,278 @@ def find_candidates_for_agenda(
         if "fts_score" in row_dict:
             data["fts_score"] = row_dict["fts_score"]
         candidates.append(data)
+    # Bias core actionable types to the top
+    core_order = {"decision": 0, "open_question": 1, "question": 2, "risk": 3, "action_item": 4, "milestone": 5}
+    candidates.sort(key=lambda c: core_order.get((c.get("fact_type") or "").lower(), 99))
     return candidates
+
+
+# --- Subject-first helpers ---
+
+def _days_between_iso(now_iso: Optional[str], past_iso: Optional[str]) -> Optional[float]:
+    from datetime import datetime, timezone
+    def parse(s: Optional[str]) -> Optional[datetime]:
+        if not s:
+            return None
+        try:
+            # Support both Z and offsetless
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    now = parse(now_iso) or datetime.utcnow().replace(tzinfo=timezone.utc)
+    past = parse(past_iso)
+    if not past:
+        return None
+    return (now - past).total_seconds() / 86400.0
+
+
+def _urgency_from_due(due_iso: Optional[str]) -> float:
+    # Map due in days to 0..1 with simple bands
+    if not due_iso:
+        return 0.1
+    from datetime import datetime, timezone
+    try:
+        due = datetime.fromisoformat(due_iso.replace("Z", "+00:00"))
+        now = datetime.utcnow().replace(tzinfo=timezone.utc)
+        delta_days = (due - now).total_seconds() / 86400.0
+    except Exception:
+        return 0.1
+    if delta_days <= 0:
+        return 1.0
+    if delta_days <= 3:
+        return 0.9
+    if delta_days <= 7:
+        return 0.7
+    if delta_days <= 14:
+        return 0.5
+    return 0.3
+
+
+def find_subject_candidates(org_id: str, lookback_days: int = 30, k: int = 5, language: str = "auto") -> list[dict]:
+    org_id = org_id or DEFAULT_ORG_ID
+    rows = db.get_recent_facts(org_id, ["decision", "open_question", "risk", "action_item", "milestone"], 300)
+    if not rows:
+        return []
+    # Keep only vetted
+    rows = [r for r in rows if (str(r["status"] or "").lower() in {"validated", "published"})]
+    if not rows:
+        return []
+    # Optional lookback filter
+    from datetime import datetime, timezone, timedelta
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    def _within(row):
+        try:
+            ts = datetime.fromisoformat((row["created_at"] or "").replace("Z", "+00:00"))
+            return (now - ts) <= timedelta(days=lookback_days)
+        except Exception:
+            return True
+    rows = [r for r in rows if _within(r)]
+    if not rows:
+        return []
+    # Hydrate related
+    fact_ids = [r["fact_id"] for r in rows]
+    related = _hydrate_related(fact_ids)
+    ev_map = related["evidence"]
+
+    # Build simple theme clusters by normalized text key (first sentence refined)
+    from collections import defaultdict
+    clusters: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        ftype = (r["fact_type"] or "").lower()
+        fid = r["fact_id"]
+        payload = _parse_payload(r["payload"])  # type: ignore[arg-type]
+        # Avoid evidence quotes when forming subjects; prefer payload fields only
+        text = _extract_subject_text(payload, []) or (payload.get("text") or "")
+        text = refine_subject_text(text, language=(language if language != "auto" else (db.get_org_context(org_id)["language"] if db.get_org_context(org_id) else "en-US")))  # type: ignore[index]
+        key = _normalize_key(text)
+        if not key:
+            continue
+        c = clusters.get(key)
+        if not c:
+            due_val = r["due_iso"] if "due_iso" in r.keys() else None
+            conf_val = r["confidence"] if "confidence" in r.keys() else 0.6
+            created_val = r["created_at"] if "created_at" in r.keys() else None
+            clusters[key] = {
+                "text": text,
+                "fact_types": {ftype: 1},
+                "supporting_fact_ids": [fid],
+                "due_list": [due_val],
+                "conf": [conf_val],
+                "created": [created_val],
+            }
+        else:
+            c["fact_types"][ftype] = c["fact_types"].get(ftype, 0) + 1
+            c["supporting_fact_ids"].append(fid)
+            c["due_list"].append(r["due_iso"] if "due_iso" in r.keys() else None)
+            c["conf"].append(r["confidence"] if "confidence" in r.keys() else 0.6)
+            c["created"].append(r["created_at"] if "created_at" in r.keys() else None)
+
+    # Score clusters
+    def _type_impact(ft_counts: Dict[str, int]) -> float:
+        w = {"decision": 1.0, "open_question": 0.8, "risk": 0.9, "action_item": 0.7, "milestone": 0.9}
+        num = sum(ft_counts.values()) or 1
+        return sum(w.get(t, 0.5) * n for t, n in ft_counts.items()) / num
+
+    cands: List[Dict[str, Any]] = []
+    for key, c in clusters.items():
+        due = None
+        # earliest due in cluster
+        dues = [d for d in c["due_list"] if d]
+        if dues:
+            due = sorted(dues)[0]
+        urgency = _urgency_from_due(due)
+        impact = _type_impact(c["fact_types"])  # average type weight
+        # recency = newest item is best
+        newest = None
+        created = [dt for dt in c["created"] if dt]
+        if created:
+            newest = max(created)
+        days = _days_between_iso(None, newest) if newest else 30.0
+        recency = 1.0 / (1.0 + (days or 30.0) / 7.0)
+        confidence = sum(c["conf"]) / max(1, len(c["conf"]))
+        coverage = min(1.0, len(c["supporting_fact_ids"]) / 6.0)
+        score = round(0.35 * urgency + 0.25 * impact + 0.20 * recency + 0.10 * confidence + 0.10 * coverage, 4)
+        # Subject phrasing by dominant type
+        dom = sorted(c["fact_types"].items(), key=lambda kv: kv[1], reverse=True)[0][0]
+        base = c["text"].strip().rstrip(".")
+        if (language or "en-US") == "pt-BR":
+            prefix = {"decision": "Decidir:", "open_question": "Resolver:", "risk": "Mitigar:", "action_item": "Planejar:", "milestone": "Alcançar:"}.get(dom, "Alinhar:")
+        else:
+            prefix = {"decision": "Decide:", "open_question": "Resolve:", "risk": "Mitigate:", "action_item": "Plan:", "milestone": "Achieve:"}.get(dom, "Align:")
+        subj = f"{prefix} {base}"
+        cands.append({
+            "subject": subj,
+            "score": score,
+            "due_iso": due,
+            "dominant_type": dom,
+            "supporting_fact_ids": c["supporting_fact_ids"],
+        })
+    cands.sort(key=lambda x: x["score"], reverse=True)
+    return cands[:k]
+
+
+def retrieve_facts_for_subject(org_id: str, subject: str, limit: int = 60, language: str = "auto") -> list[dict]:
+    org_id = org_id or DEFAULT_ORG_ID
+    # Opportunistic auto-validation to avoid empty subject retrievals due to draft/proposed
+    try:
+        recent = db.get_recent_facts(org_id, ["decision", "open_question", "risk", "action_item", "milestone"], 120)
+        if any(str(r["status"] or "").lower() in {"draft", "proposed"} for r in recent):
+            auto_validate.validate_org_if_needed(org_id, ["decision", "open_question", "risk", "action_item", "milestone"], max_to_validate=120)
+    except Exception:
+        pass
+    # Try embedding-based search if available
+    items: List[Any] = []
+    try:
+        from .indexing import similarity_search  # type: ignore
+        items = similarity_search(org_id, subject, top_k=limit, filters={
+            "types": ["decision", "open_question", "risk", "action_item", "milestone"],
+            "status": ["validated", "published"],
+        })
+    except Exception:
+        # Fallback to FTS/LIKE hybrid
+        rows = db.search_facts(org_id, subject or "", ["decision", "open_question", "risk", "action_item", "milestone"], limit)
+        if not rows:
+            # OR-token fallback
+            tokens = [t for t in re.findall(r"\w+", (subject or "").lower()) if len(t) >= 3]
+            toks = []
+            seen = set()
+            for t in tokens:
+                if t not in seen:
+                    seen.add(t); toks.append(t)
+            if toks:
+                or_query = " OR ".join(toks)
+                rows = db.search_facts(org_id, or_query, ["decision", "open_question", "risk", "action_item", "milestone"], limit)
+        items = rows or []
+    if not items:
+        return []
+    # Keep vetted only and allowed types
+    allowed = {"decision", "open_question", "risk", "action_item", "milestone"}
+    def _row_like(r):
+        # If embedding result already a dict-like row
+        return r
+    rows2 = []
+    for r in items:
+        try:
+            typ = (r["fact_type"] or "").lower()
+            st = (r["status"] or "").lower()
+        except Exception:
+            # assume dict-like
+            typ = (r.get("fact_type") or "").lower()
+            st = (r.get("status") or "").lower()
+        if st in {"validated", "published"} and typ in allowed:
+            rows2.append(r)
+    # Hydrate
+    fact_ids = [r["fact_id"] if isinstance(r, dict) else r["fact_id"] for r in rows2]  # type: ignore[index]
+    related = _hydrate_related(fact_ids)
+    evidence_map = related["evidence"]
+    entities_map = related["entities"]
+    # Rank: similarity (fts_score if available → smaller better ⇒ invert), due date asc, recency desc
+    def sim_score(r: Any) -> float:
+        s = None
+        if isinstance(r, dict):
+            s = r.get("fts_score")
+        else:
+            try:
+                s = r["fts_score"]
+            except Exception:
+                s = None
+        if s is None:
+            # crude token overlap vs subject
+            a = set(re.findall(r"\w+", subject.lower()))
+            b = set(re.findall(r"\w+", (_parse_payload(r.get("payload") if isinstance(r, dict) else r["payload"]).get("text", "").lower())))  # type: ignore[index]
+            inter = len(a & b)
+            return float(inter)
+        try:
+            return 1.0 / (1.0 + float(s))
+        except Exception:
+            return 0.0
+    def due_of(r: Any) -> str:
+        try:
+            return (r.get("due_iso") or r.get("due_at") or "") if isinstance(r, dict) else (r["due_iso"] or r["due_at"] or "")
+        except Exception:
+            return ""
+    def created_of(r: Any) -> str:
+        try:
+            return (r.get("created_at") or "") if isinstance(r, dict) else (r["created_at"] or "")
+        except Exception:
+            return ""
+    rows2.sort(key=lambda r: ( -sim_score(r), (due_of(r) or "9999-12-31"), created_of(r) ), reverse=False)
+    # De-duplicate by normalized text; cap meeting_metadata ≤ 1 (shouldn’t appear due to allowed types, but safety)
+    seen = set(); out: List[Candidate] = []; mm_count = 0
+    for r in rows2:
+        row_dict = _row_to_dict(r) if not isinstance(r, dict) else r
+        payload = _parse_payload(row_dict.get("payload"))
+        txt = payload.get("subject") or payload.get("title") or payload.get("text") or ""
+        key = _normalize_key(txt)
+        if not key or key in seen:
+            continue
+        if (row_dict.get("fact_type") or "").lower() == "meeting_metadata":
+            if mm_count >= 1: continue
+            mm_count += 1
+        fid = row_dict["fact_id"]
+        data: Candidate = {
+            "fact_id": fid,
+            "org_id": row_dict["org_id"],
+            "meeting_id": row_dict.get("meeting_id"),
+            "transcript_id": row_dict.get("transcript_id"),
+            "fact_type": row_dict["fact_type"],
+            "status": row_dict["status"],
+            "confidence": row_dict.get("confidence"),
+            "payload": payload,
+            "due_iso": row_dict.get("due_iso"),
+            "due_at": row_dict.get("due_at"),
+            "created_at": row_dict.get("created_at"),
+            "updated_at": row_dict.get("updated_at"),
+            "evidence": evidence_map.get(fid, []),
+            "entities": entities_map.get(fid, []),
+        }
+        if "fts_score" in row_dict:
+            data["fts_score"] = row_dict["fts_score"]
+        out.append(data)
+        seen.add(key)
+        if len(out) >= limit:
+            break
+    return out
 
 
 # --- Subject inference for next-meeting planning ---
@@ -227,20 +512,54 @@ def looks_generic_subject(subject: Optional[str], language: str = "en-US") -> bo
 
 
 def infer_best_subject(org_id: str, *, language: str = "en-US") -> Optional[str]:
-    """Pick and synthesize a subject from recent facts for the next meeting."""
-    cands = infer_candidate_subjects(org_id)
+    # Use scored clusters (validated|published only)
+    cands = find_subject_candidates(org_id, lookback_days=30, k=5, language=language)
     if not cands:
         return None
-    top_texts = [t for (t, _s) in cands[:5] if isinstance(t, str) and t.strip()]
-    subject = synthesize_subject_from_texts(top_texts, language=language)
-    if subject and not looks_generic_subject(subject, language):
-        return subject
-    # Fallbacks: return refined top candidate
-    for text in top_texts:
-        refined = refine_subject_text(text, language)
-        if refined and not looks_generic_subject(refined, language):
-            return refined
-    return refine_subject_text(cands[0][0], language)
+
+    # Helper: fast reject low-quality/banlist subjects (esp. PT)
+    def _bad_subject(s: str) -> bool:
+        if not isinstance(s, str):
+            return True
+        t = (s or "").strip()
+        if len(t.split()) < 2:
+            return True
+        low = t.lower()
+        # Ban common conversational tokens that leak from transcripts
+        ban_pt = {"hoje", "hj", "gente", "pessoal", "galera", "participante", "participantes"}
+        if language == "pt-BR" and any(b in low.split() for b in ban_pt):
+            return True
+        return looks_generic_subject(t, language)
+
+    # Pick the top candidate, LLM-polish it if possible, else refine heuristically
+    top = None
+    for c in cands:
+        subj = c.get("subject") or ""
+        # Try validator LLM rewrite if available
+        try:
+            # Expected to exist in your validator module; safe no-op if missing.
+            from . import auto_validate
+            subj2 = auto_validate.rewrite_subject(
+                subject=subj,
+                supporting_fact_ids=c.get("supporting_fact_ids") or [],
+                language=language,
+                max_words=10,
+            )
+            if isinstance(subj2, str) and subj2.strip():
+                subj = subj2.strip()
+        except Exception:
+            # Fallback: heuristic refine
+            subj = refine_subject_text(subj, language)
+
+        if not _bad_subject(subj):
+            top = subj
+            break
+
+    if not top:
+        # As a last resort: refine the best raw candidate
+        top = refine_subject_text(cands[0].get("subject") or "", language)
+
+    return top or None
 
 
 # --- Subject synthesis utilities ---
@@ -312,7 +631,7 @@ def synthesize_subject_from_texts(texts: Sequence[str], *, language: str = "en-U
     if not toks:
         return None
     # Stopwords
-    stop_pt = {"de","da","do","das","dos","e","em","para","por","que","uma","um","uns","umas","na","no","nas","nos","com","sobre","ao","a","o","as","os"}
+    stop_pt = {"de","da","do","das","dos","e","em","para","por","que","uma","um","uns","umas","na","no","nas","nos","com","sobre","ao","a","o","as","os","pra","pro","hoje","hj","gente","pessoal","galera","participante","participantes","todo","mundo"}
     stop_en = {"the","and","for","with","a","an","of","in","on","to","by","about","from","as","at","is","are"}
     stop = stop_pt if language == "pt-BR" else stop_en
     # Count frequencies

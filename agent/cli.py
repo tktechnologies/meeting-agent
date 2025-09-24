@@ -108,6 +108,10 @@ def cmd_agenda_preview(args: argparse.Namespace) -> None:
     if args.nl:
         lang = args.language or "en-US"
         text = textgen.agenda_to_text(result["proposal"], language=lang, use_llm=args.llm)
+        if getattr(args, "debug", False):
+            sup = (result.get("proposal") or {}).get("supporting_fact_ids") or []
+            if sup:
+                text += "\n\nEvidence IDs: " + ", ".join(map(str, sup)) + "\n"
         print(text)
     else:
         _json_print(result)
@@ -133,6 +137,10 @@ def cmd_agenda_nl(args: argparse.Namespace) -> None:
     )
     if args.nl:
         text_out = textgen.agenda_to_text(result["proposal"], language=lang, use_llm=args.llm)
+        if getattr(args, "debug", False):
+            sup = (result.get("proposal") or {}).get("supporting_fact_ids") or []
+            if sup:
+                text_out += "\n\nEvidence IDs: " + ", ".join(map(str, sup)) + "\n"
         print(text_out)
     else:
         _json_print(result)
@@ -157,6 +165,10 @@ def cmd_agenda_standard(args: argparse.Namespace) -> None:
     if args.nl:
         lang = args.language or "en-US"
         text = textgen.agenda_to_text(result["proposal"], language=lang, use_llm=args.llm)
+        if getattr(args, "debug", False):
+            sup = (result.get("proposal") or {}).get("supporting_fact_ids") or []
+            if sup:
+                text += "\n\nEvidence IDs: " + ", ".join(map(str, sup)) + "\n"
         print(text)
     else:
         _json_print(result)
@@ -295,6 +307,7 @@ def build_parser() -> argparse.ArgumentParser:
     agenda_preview.add_argument("--llm", action="store_true", help="Use LLM to improve text (requires OPENAI_API_KEY)")
     agenda_preview.add_argument("--next", action="store_true", help="Use forward-looking mode (next subjects)")
     agenda_preview.add_argument("--context", default=None, help="Optional company context text")
+    agenda_preview.add_argument("--debug", action="store_true", help="Append Evidence IDs to NL output")
     agenda_preview.set_defaults(func=cmd_agenda_preview)
 
     agenda_standard = agenda_sub.add_parser("standard", help="Plan a standard (no-subject) agenda without persisting")
@@ -305,6 +318,7 @@ def build_parser() -> argparse.ArgumentParser:
     agenda_standard.add_argument("--llm", action="store_true", help="Use LLM to improve text (requires OPENAI_API_KEY)")
     agenda_standard.add_argument("--next", action="store_true", help="Use forward-looking mode (next subjects)")
     agenda_standard.add_argument("--context", default=None, help="Optional company context text")
+    agenda_standard.add_argument("--debug", action="store_true", help="Append Evidence IDs to NL output")
     agenda_standard.set_defaults(func=cmd_agenda_standard)
 
     agenda_subject = agenda_sub.add_parser("subject", help="Plan a subject-focused agenda without persisting")
@@ -327,6 +341,7 @@ def build_parser() -> argparse.ArgumentParser:
     agenda_nl.add_argument("--context", default=None, help="Optional company context override")
     agenda_nl.add_argument("--nl", action="store_true", help="Output in natural language instead of JSON")
     agenda_nl.add_argument("--llm", action="store_true", help="Use LLM to improve text (requires OPENAI_API_KEY)")
+    agenda_nl.add_argument("--debug", action="store_true", help="Append Evidence IDs to NL output")
     agenda_nl.set_defaults(func=cmd_agenda_nl)
 
     facts_cmd = sub.add_parser("facts", help="Facts utilities")
