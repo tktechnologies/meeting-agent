@@ -3,8 +3,15 @@
 import argparse
 import json
 import secrets
+import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+
+# Ensure the meeting-agent root is on sys.path so 'agent' imports work regardless of CWD
+MEETING_AGENT_ROOT = Path(__file__).resolve().parents[1]
+if str(MEETING_AGENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(MEETING_AGENT_ROOT))
 
 from agent import db
 from agent.config import DEFAULT_ORG_ID
@@ -163,7 +170,15 @@ def ingest_bundle(
     participants = meeting.get("participants") or []
 
     db.init_db()
-    db.ensure_org(org_id, org_name or org_id)
+    # Resolve org conflicts: if a row with the same display name exists under a different org_id,
+    # reuse that org_id to avoid FK failures and name UNIQUE conflicts.
+    preferred_name = org_name or org_id
+    existing = db.get_org(org_id) or db.find_org_by_text(preferred_name)
+    if existing:
+        existing_id = existing["org_id"]
+        if existing_id != org_id:
+            org_id = existing_id
+    db.ensure_org(org_id, preferred_name)
 
     participant_lookup = _ensure_participants(org_id, participants)
 
