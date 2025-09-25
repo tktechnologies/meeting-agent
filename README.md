@@ -71,6 +71,88 @@ Run `python -m agent.api` once FastAPI/Uvicorn are installed. Key endpoints:
 - `GET /facts/search?org=org_demo&q=pricing&types=decision,action_item`
 - `POST /facts/{fact_id}/status` – body `{ "status": "validated" }`
 
+### Running with Uvicorn (no Docker)
+
+Install dependencies (if you only installed the library pieces):
+
+```bash
+pip install fastapi uvicorn
+```
+
+Initialize (idempotent) then start the ASGI app:
+
+```bash
+python -m agent.cli init-db --org org_demo
+uvicorn agent.api:app --host 0.0.0.0 --port 8000
+```
+
+During development you can enable autoreload:
+
+```bash
+uvicorn agent.api:app --reload --port 8000
+```
+
+Quick smoke:
+
+```bash
+curl -s http://localhost:8000/health
+curl -s -X POST http://localhost:8000/agenda/plan-nl -H "Content-Type: application/json" \
+	-d '{"text":"próxima reunião sobre integrações, 30 min","format":"nl"}' | jq .text
+```
+
+### Natural language agenda planning
+
+New capabilities:
+
+- `POST /agenda/propose` now accepts `prompt` (free text) and `format=nl` to return a rendered textual agenda instead of JSON.
+- `POST /agenda/plan-nl` parses a free‐text prompt without persisting (preview only). Accepts `format=nl`.
+- `GET /health` returns `{ "ok": true }` for liveness checks.
+
+Examples (JSON bodies):
+
+```
+POST /agenda/plan-nl
+{ "text": "faça a pauta da próxima reunião com a BYD sobre integração de API, 60 min", "format": "nl" }
+
+POST /agenda/propose
+{ "org": "byd", "prompt": "próxima reunião com a BYD sobre custos logísticos, 45 min", "format": "nl" }
+```
+
+Duration extraction supports patterns like: `60 min`, `1h30`, `90m`, `meia hora`, `uma hora e meia`, `half an hour`, `one hour and a half`.
+
+If a subject isn’t detected, the planner falls back to a forward-looking (next-only) agenda; if a concrete subject is parsed (e.g. after `sobre / about`), it uses the subject-centered path automatically.
+
+### Text agenda output hygiene
+The textual agenda renderer removes redundant prefixes (e.g. `Decidir:` repeated), trims trailing conjunctions, and normalizes Portuguese risk/decision bullets.
+
+## Docker
+
+A minimal container image is provided via the root `Dockerfile` (FastAPI server on port 8000):
+
+Build:
+
+```bash
+docker build -t meeting-agent:latest .
+```
+
+Run:
+
+```bash
+docker run -p 8000:8000 -e DEFAULT_ORG_ID=byd meeting-agent:latest
+```
+
+Then call (adjust host if remote):
+
+```bash
+curl -s http://localhost:8000/health
+curl -s -X POST http://localhost:8000/agenda/plan-nl -H "Content-Type: application/json" \
+	-d '{"text":"próxima reunião com a BYD sobre integrações, 45 min","format":"nl"}'
+```
+
+Environment variables:
+- `SPINE_DB_PATH` – SQLite path (defaults to `/app/meeting-agent/spine_dev.sqlite3` in container)
+- `DEFAULT_ORG_ID` – org id created at container start (default `org_demo`)
+
 ## Data notes
 - Database path defaults to `./spine_dev.sqlite3` (override with `SPINE_DB_PATH`).
 - FTS can be disabled via `SPINE_FTS_ENABLED=0`.

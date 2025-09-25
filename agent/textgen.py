@@ -42,6 +42,15 @@ def _sanitize_text(text: str, language: str) -> str:
     # Drop fragments that are too short or non-informative
     if len(s) < 6 or len(s.split()) < 3 or not any(ch.isalpha() for ch in s):
         return ""
+    # Extra PT-BR hygiene: remove trailing coordinating conjunctions and drop acronym-heavy short bullets
+    if language == "pt-BR":
+        # cut trailing conjunction-only endings
+        s = re.sub(r"\b(e|mas|porque|então|entao)\s*$", "", s, flags=re.IGNORECASE).strip()
+        tokens = s.split()
+        if tokens:
+            upper_ratio = sum(t.isupper() for t in tokens) / max(1, len(tokens))
+            if upper_ratio > 0.5 and len(tokens) < 5:
+                return ""
     return s
 
 
@@ -53,6 +62,19 @@ def _deterministic_text(agenda: Dict[str, Any], subject: Dict[str, Any], languag
         t = " ".join(str(s).split())
         MAX = 160
         return (t if len(t) <= MAX else (t[:MAX-1] + "…"))
+    def _strip_prefix_for_section(text: str, section_title: str) -> str:
+        low = (section_title or "").lower()
+        import re as _re
+        # Decisions section: remove leading "Decidir:" / "Decide:" since section already implies it
+        if low.startswith("decis"):
+            return _re.sub(r"^(?:decidir|decide):\s*", "", text, flags=_re.IGNORECASE)
+        # Open Questions section: remove redundant "Responder:" / "Answer:" prefix
+        if "perguntas" in low or "open questions" in low:
+            return _re.sub(r"^(?:responder|answer):\s*", "", text, flags=_re.IGNORECASE)
+        # Risks section: remove redundant "Mitigar:" / "Mitigate:" prefix
+        if low.startswith("riscos") or low.startswith("risks"):
+            return _re.sub(r"^(?:mitigar|mitigate):\s*", "", text, flags=_re.IGNORECASE)
+        return text
     def rewrite_pt(text: str, section_title: str) -> str:
         s = text
         low = s.lower()
@@ -76,6 +98,7 @@ def _deterministic_text(agenda: Dict[str, Any], subject: Dict[str, Any], languag
                 return "Revisar: " + s[len("revisar"):].strip().rstrip(".")
         
         # Append (TBD) in Próximos Passos when owner/due missing is handled later
+    # Future polish: we could drop ultra-generic bullets like "Alinhar objetivos" once more context rules exist
         return s
 
     title = agenda.get("title") or ("Reunião" if language == "pt-BR" else "Meeting")
@@ -101,6 +124,75 @@ def _deterministic_text(agenda: Dict[str, Any], subject: Dict[str, Any], languag
         else:
             out.append(line(f"Subject: {subj_q}"))
     sections = agenda.get("sections") or []
+    # Pre-pass: apply risk filtering rules before rendering to avoid noisy lines
+    def _filter_risks(sec_list):
+        import re as _re
+        cleaned = []
+        seen_norm = set()
+        for s in sec_list:
+            title = (s.get("title") or "").strip()
+            if not title.lower().startswith("ris") and not title.lower().startswith("risc"):
+                cleaned.append(s)
+                continue
+            items = s.get("items") or []
+            new_items = []
+            for it in items:
+                bullets = it.get("bullets") or []
+                new_bullets = []
+                for b in bullets:
+                    txt = (b.get("text") or "").strip()
+                    if not txt:
+                        continue
+                    low = txt.lower()
+                    # Strip trailing punctuation for normalization
+                    norm = low.rstrip(" .,:;!?")
+                    # Remove terminal conjunctions
+                    norm = _re.sub(r"\b(e|mas|porque|então|entao)$", "", norm).strip()
+                    # Filter starts
+                    bad_starts = ("mas ", "é isso", "e isso", "eu ", "a gente ")
+                    if any(norm.startswith(bs) for bs in bad_starts):
+                        continue
+                    # Filter endings still ending with lone conjunction
+                    if _re.search(r"\b(e|mas|porque|então|entao)$", norm):
+                        continue
+                    # Token check
+                    toks = [t for t in _re.findall(r"[\wÀ-ÿ]+", norm) if t]
+                    if len(toks) < 5:
+                        continue
+                    # Dedupe near-identical
+                    norm_key = norm
+                    if norm_key in seen_norm:
+                        continue
+                    seen_norm.add(norm_key)
+                    # Rebuild possibly trimmed text (capitalize first char)
+                    if norm and not norm[0].isupper():
+                        norm = norm[0].upper() + norm[1:]
+                    nb = dict(b)
+                    nb["text"] = norm
+                    new_bullets.append(nb)
+                if new_bullets:
+                    new_items.append({"heading": it.get("heading"), "bullets": new_bullets})
+            # If after filtering no bullets, we skip; we'll add fallback later
+            s2 = dict(s)
+            s2["items"] = new_items
+            cleaned.append(s2)
+        # After processing, ensure at least one risk bullet if there was originally a Risks section
+        had_risks = any((sec.get("title") or "").lower().startswith("ris") for sec in sec_list)
+        if had_risks:
+            # Find risk section in cleaned
+            for sec in cleaned:
+                if (sec.get("title") or "").lower().startswith("ris"):
+                    total_bullets = sum(len(it.get("bullets") or []) for it in (sec.get("items") or []))
+                    if total_bullets == 0:
+                        fallback_text = (
+                            "Mitigar: possíveis atrasos ou bloqueios críticos nos próximos marcos" if language == "pt-BR" else
+                            "Mitigate: potential delays or blockers impacting upcoming milestones"
+                        )
+                        sec["items"] = [{"heading": sec.get("title"), "bullets": [{"text": fallback_text}]}]
+                    break
+        return cleaned
+
+    sections = _filter_risks(sections)
     for sec in sections:
         stitle = sec.get("title") or ("Seção" if language == "pt-BR" else "Section")
         smin = sec.get("minutes") or 0
@@ -116,6 +208,8 @@ def _deterministic_text(agenda: Dict[str, Any], subject: Dict[str, Any], languag
                 raw = b.get("text") or b.get("title") or ""
                 text = clean(raw)
                 text = _sanitize_text(text, language)
+                # Remove redundant action prefixes that duplicate section semantics
+                text = _strip_prefix_for_section(text, stitle)
                 # Skip empty/garbled bullets
                 w = text.split()
                 if not text or not any(ch.isalnum() for ch in text):

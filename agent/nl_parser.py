@@ -61,6 +61,51 @@ def _extract_subject(text: str, lang: str) -> Optional[str]:
     return None
 
 
+def _extract_duration_minutes(text: str, lang: str) -> Optional[int]:
+    """Best-effort extraction of duration in minutes from free text.
+
+    Supports patterns like:
+      - 90 min / 90 minutes
+      - 60m
+      - 1h / 1h30 / 1 h 30
+      - meia hora / uma hora / uma hora e meia (pt-BR)
+      - half an hour / one hour / one hour and a half (en)
+    Returns None if no reliable signal found. Enforces a minimum of 5 minutes.
+    """
+    s = (text or "").lower().strip()
+    if not s:
+        return None
+    import re as _re
+    # Hours with optional minutes: 1h, 2h30, 1 h 05
+    m = _re.search(r"\b(\d{1,2})\s*h(?:\s*(\d{1,2}))?\b", s)
+    if m:
+        h = int(m.group(1))
+        mm = int(m.group(2) or 0)
+        if mm >= 60:  # guard against typos like 1h90
+            mm = 0
+        return max(5, h * 60 + mm)
+    # Explicit minutes: 45 min / 45 mins / 45 minutes
+    m = _re.search(r"\b(\d{1,3})\s*(?:min|mins|minutes?)\b", s)
+    if m:
+        return max(5, int(m.group(1)))
+    # Shorthand 60m, 30m
+    m = _re.search(r"\b(\d{1,3})\s*m\b", s)
+    if m:
+        return max(5, int(m.group(1)))
+    # Portuguese verbal expressions
+    if lang == "pt-BR":
+        if _re.search(r"\bmeia\s+hora\b", s):
+            return 30
+        if _re.search(r"\buma\s+hora(?:\s+e\s+meia)?\b", s):
+            return 90 if "meia" in s else 60
+    else:
+        if _re.search(r"\bhalf\s+an?\s+hour\b", s):
+            return 30
+        if _re.search(r"\bone\s+hour(?:\s+and\s+a?\s+half)?\b", s):
+            return 90 if "half" in s else 60
+    return None
+
+
 def _extract_org_hint(text: str) -> Optional[str]:
     # English: for <org> ... (stop before time hints and about/on)
     m = re.search(r"(?i)\bfor\s+(.+?)\s*(?=(about|on|,|$|today|tomorrow|next\s+\w+))", text)
@@ -108,7 +153,8 @@ def parse_nl(text: str, defaults: Optional[Dict[str, Any]] = None) -> AgendaNLRe
     lang = _detect_language(text)
     tz = defaults.get("timezone") or default_timezone()
     window_days = int(defaults.get("window_days") or default_window_days())
-    minutes = int(defaults.get("target_duration_minutes") or default_duration_minutes())
+    minutes_hint = _extract_duration_minutes(text, lang)
+    minutes = int(defaults.get("target_duration_minutes") or minutes_hint or default_duration_minutes())
     org = defaults.get("org_name") or _extract_org_hint(text)
     mt_hint = _extract_meeting_hint(text)
     subject = defaults.get("subject") or _extract_subject(text, lang)

@@ -48,7 +48,7 @@ def propose_agenda(
     org_id = retrieval.resolve_org_id(org)
     req_subject = subject
     minutes = duration_minutes or 30
-    lang = language or "en-US"
+    lang = language or "pt-BR"
     if prompt:
         parsed = parse_nl(prompt, {})
         req_subject = req_subject or parsed.subject
@@ -95,7 +95,7 @@ def plan_agenda_only(
     org_id = retrieval.resolve_org_id(org)
     req_subject = subject
     minutes = duration_minutes or 30
-    lang = language or "en-US"
+    lang = language or "pt-BR"
     if prompt:
         parsed = parse_nl(prompt, {})
         req_subject = req_subject or parsed.subject
@@ -137,15 +137,23 @@ def plan_agenda_next_only(
     *,
     org: Optional[str] = None,
     subject: Optional[str] = None,
+    prompt: Optional[str] = None,
     company_context: Optional[str] = None,
     duration_minutes: Optional[int] = None,
     language: Optional[str] = None,
     fact_types: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     org_id = retrieval.resolve_org_id(org)
-    req_subject = (subject or "").strip() or None
+    req_subject = subject
     minutes = duration_minutes or 30
-    lang = language or "en-US"
+    lang = language or "pt-BR"
+    # Optional natural language prompt parsing (consistent with propose/only variants)
+    if prompt:
+        parsed = parse_nl(prompt, {})
+        req_subject = req_subject or parsed.subject
+        minutes = duration_minutes or parsed.target_duration_minutes
+        lang = language or parsed.language
+    req_subject = (req_subject or "").strip() or None
     types = list(fact_types or DEFAULT_FACT_TYPES)
     # If no specific subject or a generic one is provided, infer a likely next subject
     if not req_subject or retrieval.looks_generic_subject(req_subject, lang):

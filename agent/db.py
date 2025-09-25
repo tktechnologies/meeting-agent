@@ -341,10 +341,16 @@ def refresh_fact_fts(fact_id: str, conn: Optional[sqlite3.Connection] = None) ->
             return
         payload = _ensure_json(row["payload"])
         pieces = []
+        def _clean_for_fts(s: str) -> str:
+            import re as _re
+            s = _re.sub(r"\bParticipante\s+\d+\b", "", s, flags=_re.IGNORECASE)
+            s = _re.sub(r"\(\d{1,2}:\d{2}(?::\d{2})?\)", "", s)
+            s = _re.sub(r"\s+", " ", s).strip()
+            return s
         for key in ("title", "name", "text", "subject"):
             val = payload.get(key)
             if isinstance(val, str) and val.strip():
-                pieces.append(val.strip())
+                pieces.append(_clean_for_fts(val.strip()))
         pieces.extend(_flatten_strings(payload.get("agenda")))
         evidence_rows = local_conn.execute(
             "SELECT quote FROM fact_evidence WHERE fact_id=?",
@@ -353,7 +359,7 @@ def refresh_fact_fts(fact_id: str, conn: Optional[sqlite3.Connection] = None) ->
         for q in evidence_rows:
             quote = q["quote"]
             if isinstance(quote, str) and quote.strip():
-                pieces.append(quote.strip())
+                pieces.append(_clean_for_fts(quote.strip()))
         content = "\n".join(pieces).strip()
         local_conn.execute("DELETE FROM fact_fts WHERE fact_id=?", (fact_id,))
         if content:

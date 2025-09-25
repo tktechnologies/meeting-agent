@@ -175,6 +175,10 @@ def _quality_score(text: str, language: str) -> float:
     # Penalize likely truncated words
     if language == "pt-BR" and (last.endswith("çã") or last.endswith("negóci") or last.endswith("inform") or last.endswith("cont") or last.endswith("cadast")):
         score -= 0.3
+    # Penalize trailing conjunctions (often truncated)
+    last_word = (tokens[-1] or "").lower()
+    if last_word in {"e", "mas", "porque", "então", "entao", "and", "but", "because", "so"}:
+        score -= 0.2
     return max(0.0, min(1.0, score))
 
 
@@ -190,7 +194,10 @@ def _infer_kind_from_text(text: str, language: str) -> Optional[str]:
     if any(re.search(p, low) for p in q_patterns):
         return "question"
     # Decision signals
-    pt_dec = [r"\bdecid(?:ir|ir\s+se|ir\s+por)?\b", r"\bdecis[aã]o\b", r"\baprovar\b", r"\baprova[cç][aã]o\b", r"\bescolher\b", r"\bconfirmar\b", r"\bvalidar\b", r"\bdefinir\b", r"\bfechar\b"]
+    pt_dec = [
+        r"\bdecid(?:ir|ir\s+se|ir\s+por)?\b", r"\bdecis[aã]o\b", r"\baprovar\b", r"\baprova[cç][aã]o\b", r"\bescolher\b", r"\bconfirmar\b", r"\bvalidar\b", r"\bdefinir\b", r"\bfechar\b",
+        r"\bpriorizar\b", r"\bdestravar\b", r"\balocar\b", r"\bassinar\b", r"\bcontratar\b", r"\bhomologar\b",
+    ]
     en_dec = [r"\bdecid(?:e|e\s+if|e\s+on)\b", r"\bdecision\b", r"\bapprove\b", r"\bapproval\b", r"\bchoose\b", r"\bconfirm\b", r"\bvalidate\b", r"\bdefine\b", r"\bfinali[sz]e\b"]
     dec_patterns = pt_dec if language == "pt-BR" else en_dec
     if any(re.search(p, low) for p in dec_patterns):
@@ -238,14 +245,14 @@ def _derive_next_bullets(candidates: Sequence[Dict[str, Any]], language: str) ->
         text = _abstract_text_from_fact(fact, language)
         if not text:
             continue
-        if _quality_score(text, language) < 0.6:
+        if _quality_score(text, language) < 0.65:
             # Try to synthesize from payload strings only
             payload = fact.get("payload") or {}
             synth = _keywords_phrase([
                 payload.get("subject"), payload.get("title"), payload.get("headline"), payload.get("summary"), payload.get("text")
             ], language)
             text = _refine_phrase(synth or "", language) if synth else None
-            if not text or _quality_score(text, language) < 0.6:
+            if not text or _quality_score(text, language) < 0.65:
                 continue
         inferred = _infer_kind_from_text(text, language)
         if inferred:
@@ -326,11 +333,19 @@ def _fill_core_sections(buckets: Dict[str, List[Dict[str, Any]]], language: str)
     if not buckets.get("open_questions"):
         src = (buckets.get("alignments") or [])[:2]
         derived = []
+        import re as _re
         for b in src:
             base = _base_text(b.get("text") or "")
             if not base:
                 continue
-            txt = ("Responder: " + base.rstrip(".?") + "?") if language == "pt-BR" else ("Answer: " + base.rstrip(".?") + "?")
+            base_low = base.lower().strip()
+            is_inf = bool(_re.match(r"^(definir|escolher|priorizar|alocar|aprovar|homologar|contratar)\b", base_low))
+            if language == "pt-BR":
+                prefix = "Decidir: " if is_inf else "Responder: "
+                txt = prefix + base.rstrip(".?") + ("?" if not base.endswith("?") else "")
+            else:
+                prefix = "Decide: " if is_inf else "Answer: "
+                txt = prefix + base.rstrip(".?") + ("?" if not base.endswith("?") else "")
             derived.append({"text": txt, "source_fact_id": b.get("source_fact_id")})
         if derived:
             buckets.setdefault("open_questions", []).extend(derived)
@@ -434,6 +449,13 @@ def _build_sections_next(buckets: Dict[str, List[Dict[str, Any]]], total_minutes
             i += 1
             if i > 1000:
                 break
+    # Ensure at least one alignment item exists for future meetings (guarantees alignment focus)
+    if not (buckets.get("alignments") or []):
+        if language == "pt-BR":
+            buckets["alignments"] = [{"text": "Alinhar: objetivos e critérios da reunião"}]
+        else:
+            buckets["alignments"] = [{"text": "Align: meeting goals and decision criteria"}]
+
     # Emit sections
     for lab in labels:
         key = lab["key"]
@@ -462,15 +484,16 @@ def _bullet_from_fact(fact: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     text = _abstract_text_from_fact(fact, language=lang) or _short_text_from_payload(payload)
     if not text:
         return None
-    if _quality_score(text, lang) < 0.60:
+    if _quality_score(text, lang) < 0.65:
         synth = _keywords_phrase([
             payload.get("subject"), payload.get("title"), payload.get("headline"), payload.get("summary"), payload.get("text")
         ], lang)
         text = _refine_phrase(synth or "", lang) if synth else ""
-        if _quality_score(text, lang) < 0.60:
+        if _quality_score(text, lang) < 0.65:
             return None
     owner = payload.get("owner")
-    if not owner:
+    # Only infer owner heuristically for non-PT locales to avoid hallucinated owners in PT agendas
+    if not owner and lang != "pt-BR":
         for ent in entities:
             if (ent.get("type") or "").lower() == "person":
                 owner = ent.get("display_name")
@@ -714,13 +737,23 @@ def _plan_agenda_subject_centered(
         buckets = _fill_core_sections(buckets, language)
     # Allocate sections with existing next-meeting allocator (may include Company Context)
     sections = _build_sections_next(buckets, duration_minutes, language, company_context)
+
+    # Ensure consistent ordering inside core actionable buckets by due then text
+    from datetime import datetime
+    def _sort_key(b):
+        due = (b.get("due") or "").strip()
+        return (0 if due else 1, due, (b.get("text") or ""))
+    for key in ("decisions", "next_steps", "milestones"):
+        if key in buckets:
+            buckets[key] = sorted(buckets[key], key=_sort_key)
     # Note: sections may exist even with empty items; our bullet-count fallback above addresses emptiness
     # Prepend a Goal section and a short Why section if possible
     goal_title = "Meta" if language == "pt-BR" else "Goal"
     why_title = "Contexto" if language == "pt-BR" else "Why"
+    goal_minutes = max(5, int(duration_minutes * 0.12))
     goal_sec = {
         "title": goal_title,
-        "minutes": max(5, int(duration_minutes * 0.12)),
+        "minutes": goal_minutes,
         "items": [{"heading": goal_title, "bullets": [{"text": subject}]}],
     }
     # Build a compact why from evidence snippets or company context
@@ -739,8 +772,40 @@ def _plan_agenda_subject_centered(
             break
     if not why_bullets and company_context and company_context.strip():
         why_bullets.append({"text": company_context.strip()})
+    why_minutes = 5 if why_bullets else 0
+
+    # Rebalance existing section minutes so total fits duration after adding Goal/Why
+    if sections:
+        pool = sum(max(0, s.get("minutes", 0)) for s in sections)
+        take = goal_minutes + why_minutes
+        target = max(5, duration_minutes - take)
+        if pool > 0 and target > 0:
+            ratio = target / pool
+            for s in sections:
+                m = max(0, s.get("minutes", 0))
+                has_items = bool(s.get("items")) and any(it.get("bullets") for it in s.get("items", []))
+                floor_min = 3 if not has_items else 5
+                s["minutes"] = max(floor_min, int(round(m * ratio)))
+            # rounding correction
+            diff = target - sum(s.get("minutes", 0) for s in sections)
+            i = 0
+            max_iters = 500
+            while diff != 0 and sections and i < max_iters:
+                j = i % len(sections)
+                new_val = sections[j]["minutes"] + (1 if diff > 0 else -1)
+                has_items = bool(sections[j].get("items")) and any(it.get("bullets") for it in sections[j].get("items", []))
+                floor_min = 3 if not has_items else 5
+                if new_val >= floor_min:
+                    sections[j]["minutes"] = new_val
+                    diff += (-1 if diff > 0 else 1)
+                i += 1
+            # If still diff after cap, force adjust first section
+            if diff != 0 and sections:
+                sections[0]["minutes"] = max(1, sections[0]["minutes"] + diff)
+                diff = 0
+
     if why_bullets:
-        why_sec = {"title": why_title, "minutes": 5, "items": [{"heading": why_title, "bullets": why_bullets}]}
+        why_sec = {"title": why_title, "minutes": why_minutes, "items": [{"heading": why_title, "bullets": why_bullets}]}
         sections = [goal_sec, why_sec] + sections
     else:
         sections = [goal_sec] + sections

@@ -106,7 +106,7 @@ def cmd_agenda_preview(args: argparse.Namespace) -> None:
             language=args.language,
         )
     if args.nl:
-        lang = args.language or "en-US"
+        lang = args.language or "pt-BR"
         text = textgen.agenda_to_text(result["proposal"], language=lang, use_llm=args.llm)
         if getattr(args, "debug", False):
             sup = (result.get("proposal") or {}).get("supporting_fact_ids") or []
@@ -125,6 +125,7 @@ def cmd_agenda_nl(args: argparse.Namespace) -> None:
     # Resolve org: if none found, ensure DEFAULT_ORG_ID
     org_id = retrieval.resolve_org_id(parsed.org_hint or args.org or DEFAULT_ORG_ID)
     minutes = args.duration or parsed.target_duration_minutes or 30
+    # Keep parsed.language if provided, else default pt-BR
     lang = args.language or parsed.language or "pt-BR"
     subject = args.subject or parsed.subject  # optional
     # Plan forward-looking agenda; allow override company context via flag
@@ -163,7 +164,7 @@ def cmd_agenda_standard(args: argparse.Namespace) -> None:
             language=args.language,
         )
     if args.nl:
-        lang = args.language or "en-US"
+        lang = args.language or "pt-BR"
         text = textgen.agenda_to_text(result["proposal"], language=lang, use_llm=args.llm)
         if getattr(args, "debug", False):
             sup = (result.get("proposal") or {}).get("supporting_fact_ids") or []
@@ -191,7 +192,7 @@ def cmd_agenda_subject(args: argparse.Namespace) -> None:
             language=args.language,
         )
     if args.nl:
-        lang = args.language or "en-US"
+        lang = args.language or "pt-BR"
         text = textgen.agenda_to_text(result["proposal"], language=lang, use_llm=args.llm)
         print(text)
     else:

@@ -503,6 +503,8 @@ def looks_generic_subject(subject: Optional[str], language: str = "en-US") -> bo
         return True
     pats_pt = [
         r"^fa[cç]a a pauta", r"^crie a pauta", r"^fazer a pauta", r"^montar a pauta", r"pr[óo]xima reuni[ãa]o",
+        r"^\s*(alinhamento|alinhamentos?)\s*(com\s+)?(o\s+)?pessoal\b",
+        r"\b(participantes|hoje|hj)\b",
     ]
     pats_en = [
         r"^make the agenda", r"^create the agenda", r"^build the agenda", r"next meeting",
