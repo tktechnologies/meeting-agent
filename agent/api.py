@@ -38,6 +38,7 @@ if HAVE_FASTAPI:
         language: Optional[str] = None
         prompt: Optional[str] = Field(default=None, description="Free-text request")
         format: Optional[str] = Field(default="json", description="json|nl")
+        justify: Optional[bool] = Field(default=False, description="Include references in text output when format=nl")
 
     class StatusRequest(BaseModel):
         status: str = Field(description="New fact status")
@@ -49,10 +50,12 @@ if HAVE_FASTAPI:
         language: Optional[str] = None
         context: Optional[str] = None
         format: Optional[str] = Field(default="json", description="json|nl")
+        justify: Optional[bool] = Field(default=False, description="Include references in output where applicable")
 
     @app.post("/agenda/propose")
     def agenda_propose(req: AgendaRequest):
-        org_id = retrieval.resolve_org_id(req.org)
+        # Be conservative here: do not auto-create orgs from noisy inputs
+        org_id = retrieval.resolve_org_id(req.org, allow_create=False, full_text=(req.prompt or req.subject or ""))
         result = agenda.propose_agenda(
             org=org_id,
             subject=req.subject,
@@ -75,7 +78,7 @@ if HAVE_FASTAPI:
             lang = lang or preview.get("language") or "pt-BR"
             agenda_obj = preview.get("agenda")
             if agenda_obj:
-                text = textgen.agenda_to_text({"agenda": agenda_obj, "subject": preview.get("subject")}, language=lang)
+                text = textgen.agenda_to_text({"agenda": agenda_obj, "subject": preview.get("subject")}, language=lang, with_refs=bool(req.justify))
             else:
                 text = ""
             return JSONResponse({
@@ -112,7 +115,7 @@ if HAVE_FASTAPI:
     @app.post("/agenda/plan-nl")
     def agenda_plan_nl(req: NLPlanRequest):
         parsed = nl_parser.parse_nl(req.text, {})
-        org_id = retrieval.resolve_org_id(parsed.org_hint or req.org)
+        org_id = retrieval.resolve_org_id(parsed.org_hint or req.org, allow_create=False, full_text=req.text)
         minutes = req.duration_minutes or parsed.target_duration_minutes
         lang = req.language or parsed.language
         result = agenda.plan_agenda_next_only(
@@ -122,9 +125,63 @@ if HAVE_FASTAPI:
             duration_minutes=minutes,
             language=lang,
         )
-        if (req.format or "json").lower() == "nl":
-            text = textgen.agenda_to_text(result["proposal"], language=lang)
+        fmt = (req.format or "json").lower()
+        justify = bool(req.justify)
+        if fmt == "nl":
+            prop = result.get("proposal") or {}
+            text = textgen.agenda_to_text(
+                {"agenda": prop.get("agenda"), "subject": result.get("subject")},
+                language=lang,
+                with_refs=justify,
+            )
             return JSONResponse({"org_id": org_id, "text": text, "language": lang, "subject": result.get("subject")})
+        if fmt == "json":
+            if justify:
+                prop = result.get("proposal") or {}
+                payload = textgen.agenda_to_json({"agenda": prop.get("agenda"), "subject": result.get("subject")}, language=lang, with_refs=True)
+                return JSONResponse(payload)
+            return JSONResponse(result)
+        return JSONResponse(result)
+
+    @app.get("/agenda/plan-nl")
+    def agenda_plan_nl_get(
+        text: str,
+        org: Optional[str] = None,
+        duration_minutes: Optional[int] = None,
+        language: Optional[str] = None,
+        context: Optional[str] = None,
+        format: Optional[str] = "json",
+        justify: Optional[str] = None,
+    ):
+        parsed = nl_parser.parse_nl(text, {})
+        org_id = retrieval.resolve_org_id(parsed.org_hint or org, allow_create=False, full_text=text)
+        minutes = duration_minutes or parsed.target_duration_minutes
+        lang = language or parsed.language
+        result = agenda.plan_agenda_next_only(
+            org=org_id,
+            subject=parsed.subject,
+            company_context=context,
+            duration_minutes=minutes,
+            language=lang,
+        )
+        fmt = (format or "json").lower()
+        just = False
+        if isinstance(justify, str):
+            just = justify.strip().lower() in {"1", "true", "yes", "y"}
+        if fmt == "nl":
+            prop = result.get("proposal") or {}
+            text_out = textgen.agenda_to_text(
+                {"agenda": prop.get("agenda"), "subject": result.get("subject")},
+                language=lang,
+                with_refs=just,
+            )
+            return JSONResponse({"org_id": org_id, "text": text_out, "language": lang, "subject": result.get("subject")})
+        if fmt == "json":
+            if just:
+                prop = result.get("proposal") or {}
+                payload = textgen.agenda_to_json({"agenda": prop.get("agenda"), "subject": result.get("subject")}, language=lang, with_refs=True)
+                return JSONResponse(payload)
+            return JSONResponse(result)
         return JSONResponse(result)
 
     @app.get("/health")
@@ -149,9 +206,13 @@ if HAVE_FASTAPI:
         qp = request.query_params
         org_q = qp.get("org") or None
         fmt = (qp.get("format") or "json").lower()
+        justify_q = qp.get("justify") or qp.get("refs") or None
+        justify = False
+        if isinstance(justify_q, str):
+            justify = justify_q.strip().lower() in {"1", "true", "yes", "y"}
         lang_override = qp.get("language") or None
         parsed = nl_parser.parse_nl(text, {})
-        org_id = retrieval.resolve_org_id(parsed.org_hint or org_q)
+        org_id = retrieval.resolve_org_id(parsed.org_hint or org_q, allow_create=False, full_text=text)
         lang = lang_override or parsed.language
         result = agenda.plan_agenda_next_only(
             org=org_id,
@@ -160,20 +221,32 @@ if HAVE_FASTAPI:
             language=lang,
         )
         if fmt == "nl":
-            txt = textgen.agenda_to_text(result["proposal"], language=lang)
+            prop = result.get("proposal") or {}
+            txt = textgen.agenda_to_text(
+                {"agenda": prop.get("agenda"), "subject": result.get("subject")},
+                language=lang,
+                with_refs=justify,
+            )
             return JSONResponse({
                 "org_id": org_id,
                 "language": lang,
                 "subject": result.get("subject"),
                 "text": txt,
             })
-        return JSONResponse({
-            "org_id": org_id,
-            "subject": result.get("subject"),
-            "proposal": result.get("proposal"),
-            "language": lang,
-            "parsed_minutes": parsed.target_duration_minutes,
-        })
+        # JSON format
+        if fmt == "json":
+            if justify:
+                prop = result.get("proposal") or {}
+                payload = textgen.agenda_to_json({"agenda": prop.get("agenda"), "subject": result.get("subject")}, language=lang, with_refs=True)
+                return JSONResponse(payload)
+            return JSONResponse({
+                "org_id": org_id,
+                "subject": result.get("subject"),
+                "proposal": result.get("proposal"),
+                "language": lang,
+                "parsed_minutes": parsed.target_duration_minutes,
+            })
+        return JSONResponse(result)
 
     @app.post("/facts/{fact_id}/status")
     def facts_update_status(fact_id: str, req: StatusRequest):

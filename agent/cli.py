@@ -107,7 +107,13 @@ def cmd_agenda_preview(args: argparse.Namespace) -> None:
         )
     if args.nl:
         lang = args.language or "pt-BR"
-        text = textgen.agenda_to_text(result["proposal"], language=lang, use_llm=args.llm)
+        prop = result.get("proposal") or {}
+        text = textgen.agenda_to_text(
+            {"agenda": prop.get("agenda"), "subject": result.get("subject")},
+            language=lang,
+            use_llm=args.llm,
+            with_refs=getattr(args, "with_refs", False),
+        )
         if getattr(args, "debug", False):
             sup = (result.get("proposal") or {}).get("supporting_fact_ids") or []
             if sup:
@@ -123,7 +129,11 @@ def cmd_agenda_nl(args: argparse.Namespace) -> None:
     defaults: Dict[str, Any] = {}
     parsed = parse_nl(text, defaults)
     # Resolve org: if none found, ensure DEFAULT_ORG_ID
-    org_id = retrieval.resolve_org_id(parsed.org_hint or args.org or DEFAULT_ORG_ID)
+    org_id = retrieval.resolve_org_id(
+        parsed.org_hint or args.org,
+        allow_create=False,
+        full_text=text,
+    )
     minutes = args.duration or parsed.target_duration_minutes or 30
     # Keep parsed.language if provided, else default pt-BR
     lang = args.language or parsed.language or "pt-BR"
@@ -137,7 +147,13 @@ def cmd_agenda_nl(args: argparse.Namespace) -> None:
         language=lang,
     )
     if args.nl:
-        text_out = textgen.agenda_to_text(result["proposal"], language=lang, use_llm=args.llm)
+        prop = result.get("proposal") or {}
+        text_out = textgen.agenda_to_text(
+            {"agenda": prop.get("agenda"), "subject": result.get("subject")},
+            language=lang,
+            use_llm=args.llm,
+            with_refs=getattr(args, "with_refs", False),
+        )
         if getattr(args, "debug", False):
             sup = (result.get("proposal") or {}).get("supporting_fact_ids") or []
             if sup:
@@ -165,7 +181,13 @@ def cmd_agenda_standard(args: argparse.Namespace) -> None:
         )
     if args.nl:
         lang = args.language or "pt-BR"
-        text = textgen.agenda_to_text(result["proposal"], language=lang, use_llm=args.llm)
+        prop = result.get("proposal") or {}
+        text = textgen.agenda_to_text(
+            {"agenda": prop.get("agenda"), "subject": result.get("subject")},
+            language=lang,
+            use_llm=args.llm,
+            with_refs=getattr(args, "with_refs", False),
+        )
         if getattr(args, "debug", False):
             sup = (result.get("proposal") or {}).get("supporting_fact_ids") or []
             if sup:
@@ -193,7 +215,13 @@ def cmd_agenda_subject(args: argparse.Namespace) -> None:
         )
     if args.nl:
         lang = args.language or "pt-BR"
-        text = textgen.agenda_to_text(result["proposal"], language=lang, use_llm=args.llm)
+        prop = result.get("proposal") or {}
+        text = textgen.agenda_to_text(
+            {"agenda": prop.get("agenda"), "subject": result.get("subject")},
+            language=lang,
+            use_llm=args.llm,
+            with_refs=getattr(args, "with_refs", False),
+        )
         print(text)
     else:
         _json_print(result)
@@ -309,6 +337,7 @@ def build_parser() -> argparse.ArgumentParser:
     agenda_preview.add_argument("--next", action="store_true", help="Use forward-looking mode (next subjects)")
     agenda_preview.add_argument("--context", default=None, help="Optional company context text")
     agenda_preview.add_argument("--debug", action="store_true", help="Append Evidence IDs to NL output")
+    agenda_preview.add_argument("--with-refs", action="store_true", help="Mostrar referências na saída de texto")
     agenda_preview.set_defaults(func=cmd_agenda_preview)
 
     agenda_standard = agenda_sub.add_parser("standard", help="Plan a standard (no-subject) agenda without persisting")
@@ -320,6 +349,7 @@ def build_parser() -> argparse.ArgumentParser:
     agenda_standard.add_argument("--next", action="store_true", help="Use forward-looking mode (next subjects)")
     agenda_standard.add_argument("--context", default=None, help="Optional company context text")
     agenda_standard.add_argument("--debug", action="store_true", help="Append Evidence IDs to NL output")
+    agenda_standard.add_argument("--with-refs", action="store_true", help="Mostrar referências na saída de texto")
     agenda_standard.set_defaults(func=cmd_agenda_standard)
 
     agenda_subject = agenda_sub.add_parser("subject", help="Plan a subject-focused agenda without persisting")
@@ -331,6 +361,7 @@ def build_parser() -> argparse.ArgumentParser:
     agenda_subject.add_argument("--llm", action="store_true", help="Use LLM to improve text (requires OPENAI_API_KEY)")
     agenda_subject.add_argument("--next", action="store_true", help="Use forward-looking mode (next subjects)")
     agenda_subject.add_argument("--context", default=None, help="Optional company context text")
+    agenda_subject.add_argument("--with-refs", action="store_true", help="Mostrar referências na saída de texto")
     agenda_subject.set_defaults(func=cmd_agenda_subject)
 
     agenda_nl = agenda_sub.add_parser("nl", help="Natural language entrypoint for agenda planning (forward-looking by default)")
@@ -343,6 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
     agenda_nl.add_argument("--nl", action="store_true", help="Output in natural language instead of JSON")
     agenda_nl.add_argument("--llm", action="store_true", help="Use LLM to improve text (requires OPENAI_API_KEY)")
     agenda_nl.add_argument("--debug", action="store_true", help="Append Evidence IDs to NL output")
+    agenda_nl.add_argument("--with-refs", action="store_true", help="Mostrar referências na saída de texto")
     agenda_nl.set_defaults(func=cmd_agenda_nl)
 
     facts_cmd = sub.add_parser("facts", help="Facts utilities")

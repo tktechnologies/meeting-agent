@@ -268,6 +268,11 @@ def _derive_next_bullets(candidates: Sequence[Dict[str, Any]], language: str) ->
             "due": fact.get("due_iso") or fact.get("due_at"),
             "source_fact_id": fact.get("fact_id"),
         }
+        # Attach reference to the originating fact
+        try:
+            retrieval._attach_ref(bullet, fact)  # type: ignore[attr-defined]
+        except Exception:
+            pass
         # Classify with forward-looking orientation
         if ftype in {"question", "open_question"}:
             if language == "pt-BR":
@@ -505,6 +510,11 @@ def _bullet_from_fact(fact: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "due": due,
         "source_fact_id": fact.get("fact_id"),
     }
+    # Attach reference to the originating fact
+    try:
+        retrieval._attach_ref(bullet, fact)  # type: ignore[attr-defined]
+    except Exception:
+        pass
     return bullet
 
 
@@ -764,7 +774,17 @@ def _plan_agenda_subject_centered(
         for ev in (fact.get("evidence") or [])[:1]:
             q = ev.get("quote")
             if isinstance(q, str) and q.strip():
-                why_bullets.append({"text": q.strip()[:180] + ("…" if len(q.strip()) > 180 else "")})
+                wb = {"text": q.strip()[:180] + ("…" if len(q.strip()) > 180 else "")}
+                # Attach both evidence and fact as refs (renderer will limit per bullet)
+                try:
+                    retrieval._attach_ref(wb, ev)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                try:
+                    retrieval._attach_ref(wb, fact)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                why_bullets.append(wb)
                 added += 1
                 if added >= 2:
                     break

@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 import re
 
 
@@ -54,7 +54,65 @@ def _sanitize_text(text: str, language: str) -> str:
     return s
 
 
-def _deterministic_text(agenda: Dict[str, Any], subject: Dict[str, Any], language: str) -> str:
+class _RefIndex:
+    def __init__(self):
+        self.key_to_fid: Dict[str, str] = {}
+        self.fid_to_ref: Dict[str, Dict[str, Any]] = {}
+        self.order: List[str] = []
+
+    def _key(self, r: Dict[str, Any]) -> str:
+        return (
+            (r.get("id") and f"id:{r['id']}")
+            or (r.get("url") and f"url:{r['url']}")
+            or (r.get("excerpt") and f"ex:{(r.get('excerpt') or '')[:50]}")
+            or None
+        ) or str(hash(str(sorted(r.items()))))
+
+    def add(self, r: Dict[str, Any]) -> str:
+        k = self._key(r)
+        if k in self.key_to_fid:
+            return self.key_to_fid[k]
+        fid = f"F{len(self.order)+1}"
+        self.key_to_fid[k] = fid
+        self.fid_to_ref[fid] = r
+        self.order.append(fid)
+        return fid
+
+    def all(self) -> List[Tuple[str, Dict[str, Any]]]:
+        return [(fid, self.fid_to_ref[fid]) for fid in self.order]
+
+
+from datetime import datetime, timezone, timedelta
+
+
+def _parse_date(s: Any):
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _is_stale(dt):
+    if not dt:
+        return False
+    return (datetime.now(timezone.utc) - dt) > timedelta(days=60)
+
+
+def _confidence_label(ref: Dict[str, Any]):
+    c = ref.get("confidence")
+    try:
+        if isinstance(c, (int, float)):
+            return "Alta" if c >= 0.75 else ("Média" if c >= 0.5 else "Baixa")
+    except Exception:
+        pass
+    st = (ref.get("status") or "").lower()
+    return "Média" if st in {"validated", "published"} else "Baixa"
+
+
+def _deterministic_text(agenda: Dict[str, Any], subject: Dict[str, Any], language: str, *, with_refs: bool = False, max_refs_per_bullet: int = 2) -> str:
+    ref_index = _RefIndex() if with_refs else None
     def line(s: str) -> str:
         return s.rstrip() + "\n"
     def clean(s: str) -> str:
@@ -62,6 +120,26 @@ def _deterministic_text(agenda: Dict[str, Any], subject: Dict[str, Any], languag
         t = " ".join(str(s).split())
         MAX = 160
         return (t if len(t) <= MAX else (t[:MAX-1] + "…"))
+    def _as_subject_query(sj: Any):
+        if isinstance(sj, str):
+            sj = sj.strip()
+            return sj or None
+        if isinstance(sj, dict):
+            for k in ("query", "text", "title"):
+                v = (sj.get(k) or "").strip()
+                if v:
+                    return v
+        return None
+    def _is_generic_request(text: str, lang: str) -> bool:
+        import re as _re
+        low = (text or "").strip().lower()
+        if not low:
+            return True
+        if lang == "pt-BR":
+            pats = [r"^fa[cç]a a pauta", r"^crie a pauta", r"^fazer a pauta", r"^montar a pauta", r"pr[óo]xima reuni[ãa]o"]
+        else:
+            pats = [r"^make (the )?agenda", r"^create (the )?agenda", r"^build (the )?agenda", r"next meeting"]
+        return any(_re.search(p, low) for p in pats)
     def _strip_prefix_for_section(text: str, section_title: str) -> str:
         low = (section_title or "").lower()
         import re as _re
@@ -105,10 +183,15 @@ def _deterministic_text(agenda: Dict[str, Any], subject: Dict[str, Any], languag
     minutes = agenda.get("minutes") or 30
     out: List[str] = []
     out.append(line(f"{title} — {minutes} min"))
-    subj_q = subject.get("query")
+    subj_q = _as_subject_query(subject)
     def _is_generic_subject(q: str) -> bool:
         ql = (q or "").strip().lower()
         if not ql:
+            return True
+        # Duration-only or time-like subjects are generic
+        if re.search(r"^\d+\s*(min|mins|minuto|minutos|minutes|hora|horas|hour|hours)\b", ql):
+            return True
+        if re.fullmatch(r"\d+", ql):
             return True
         patterns_pt = [
             r"^fa[cç]a a pauta", r"^crie a pauta", r"^fazer a pauta", r"^montar a pauta", r"pr[óo]xima reuni[ãa]o",
@@ -196,14 +279,13 @@ def _deterministic_text(agenda: Dict[str, Any], subject: Dict[str, Any], languag
     for sec in sections:
         stitle = sec.get("title") or ("Seção" if language == "pt-BR" else "Section")
         smin = sec.get("minutes") or 0
-        out.append(line(f"\n## {stitle} — {smin} min"))
         items = sec.get("items") or []
+        section_lines: List[str] = []
         for it in items:
             heading = it.get("heading")
             bullets = it.get("bullets") or []
-            # If item has only bullets, show heading then bullets
-            if heading:
-                out.append(line(f"- {heading}:"))
+            # Buffer item-level lines to only include heading if there are valid bullets
+            item_lines: List[str] = []
             for b in bullets:
                 raw = b.get("text") or b.get("title") or ""
                 text = clean(raw)
@@ -213,6 +295,13 @@ def _deterministic_text(agenda: Dict[str, Any], subject: Dict[str, Any], languag
                 # Skip empty/garbled bullets
                 w = text.split()
                 if not text or not any(ch.isalnum() for ch in text):
+                    continue
+                # Skip bullets identical to subject or generic requests
+                norm_text = text.strip().rstrip(".").lower()
+                norm_subj = (subj_q or "").strip().rstrip(".").lower()
+                if norm_subj and norm_text == norm_subj:
+                    continue
+                if _is_generic_request(norm_text, language):
                     continue
                 if w and (not w[0][:1].isupper() and len(w[0]) <= 4):
                     continue
@@ -235,12 +324,64 @@ def _deterministic_text(agenda: Dict[str, Any], subject: Dict[str, Any], languag
                     chips.append(("Owner") + f": {owner}")
                 if due:
                     chips.append(("Prazo" if language == "pt-BR" else "Due") + f": {due}")
+                # With refs: register refs and annotate bullet with [F*]
+                tag = ""
+                extra = 0
+                conf_annot = ""
+                if with_refs and ref_index is not None:
+                    fids: List[str] = []
+                    refs = b.get("refs") or []
+                    for rr in refs:
+                        try:
+                            fid = ref_index.add(rr)
+                            fids.append(fid)
+                        except Exception:
+                            continue
+                    if fids:
+                        tag = "".join([f"[{fid}]" for fid in fids[:max_refs_per_bullet]])
+                        extra = max(0, len(fids) - max_refs_per_bullet)
+                        # Optional: if first ref confidence is low, annotate
+                        first_ref = refs[0]
+                        if _confidence_label(first_ref) == "Baixa":
+                            conf_annot = " (Confiança: Baixa)"
                 # In PT-BR, mark TBD in Next Steps if no chips
                 if language == "pt-BR" and (stitle.lower().startswith("próximos passos") or stitle.lower().startswith("proximos passos")) and not chips:
                     text = text.rstrip(".") + " (TBD)"
                 suff = (" [" + "; ".join(chips) + "]") if chips else ""
-                out.append(line(f"  - {text}{suff}"))
-        # If section has no items, leave the header as is
+                text_line = f"  - {text}{suff}{conf_annot}"
+                if tag:
+                    text_line = f"{text_line} {tag}"
+                if extra > 0:
+                    text_line = f"{text_line} (+{extra})"
+                item_lines.append(line(text_line))
+            # Only add heading if we have any bullet lines for this item
+            if item_lines:
+                if heading:
+                    section_lines.append(line(f"- {heading}:"))
+                section_lines.extend(item_lines)
+        # Render the section header only if we collected any lines
+        if section_lines:
+            out.append(line(f"\n## {stitle} — {smin} min"))
+            out.extend(section_lines)
+    # Append references block if requested
+    if with_refs and ref_index is not None and ref_index.order:
+        out.append("\n")
+        out.append(line("## Referências" if language == "pt-BR" else "## References"))
+        for fid, ref in ref_index.all():
+            date = _parse_date(ref.get("updated_at"))
+            date_s = date.date().isoformat() if date else ""
+            lab = _confidence_label(ref)
+            stale = " \u26A0\uFE0F Desatualizado" if (language == "pt-BR" and _is_stale(date)) else (" \u26A0\uFE0F Stale" if _is_stale(date) else "")
+            title_or_excerpt = ref.get("title") or ref.get("excerpt") or "(sem título)"
+            source = ref.get("source") or ref.get("fact_type") or ""
+            owner = f", {ref['owner']}" if ref.get("owner") else ""
+            status = (ref.get("status") or "").lower()
+            if language == "pt-BR":
+                line_txt = f"{fid} — {title_or_excerpt} ({status}, {date_s}, {source}{owner}; Confiança: {lab}){stale}"
+            else:
+                # Simple EN variant
+                line_txt = f"{fid} — {title_or_excerpt} ({status}, {date_s}, {source}{owner}; Confidence: {lab}){stale}"
+            out.append(line(line_txt))
     return "".join(out).strip() + "\n"
 
 
@@ -313,9 +454,52 @@ def _llm_text(agenda: Dict[str, Any], subject: Dict[str, Any], language: str) ->
         return _deterministic_text(agenda, subject, language)
 
 
-def agenda_to_text(result: Dict[str, Any], language: str, use_llm: bool = False) -> str:
+def agenda_to_text(result: Dict[str, Any], language: str, use_llm: bool = False, with_refs: bool = False, max_refs_per_bullet: int = 2) -> str:
     agenda = result.get("agenda") or {}
     subject = result.get("subject") or {}
     if use_llm:
         return _llm_text(agenda, subject, language)
-    return _deterministic_text(agenda, subject, language)
+    return _deterministic_text(agenda, subject, language, with_refs=with_refs, max_refs_per_bullet=max_refs_per_bullet)
+
+
+def agenda_to_json(obj: Dict[str, Any], language: str = "pt-BR", with_refs: bool = True, max_refs_per_bullet: int = 3) -> Dict[str, Any]:
+    agenda = obj.get("agenda") or {}
+    subject = obj.get("subject")
+    ref_index = _RefIndex() if with_refs else None
+    # Produce a shallow copy of sections with bullets and refs; de-duplicate references
+    out_sections: List[Dict[str, Any]] = []
+    for sec in (agenda.get("sections") or []):
+        items_out: List[Dict[str, Any]] = []
+        for it in (sec.get("items") or []):
+            bullets_out: List[Dict[str, Any]] = []
+            for b in (it.get("bullets") or []):
+                bb = {k: v for k, v in b.items() if k != "refs"}
+                refs = b.get("refs") or []
+                if with_refs and ref_index is not None and refs:
+                    fids: List[str] = []
+                    for rr in refs:
+                        try:
+                            fid = ref_index.add(rr)
+                            fids.append(fid)
+                        except Exception:
+                            continue
+                    # Keep full refs on bullet but might be long; we keep as provided
+                    bb["refs"] = refs[:]
+                elif refs:
+                    bb["refs"] = refs[:]
+                bullets_out.append(bb)
+            items_out.append({"heading": it.get("heading"), "bullets": bullets_out})
+        out_sections.append({
+            "title": sec.get("title"),
+            "minutes": sec.get("minutes"),
+            "items": items_out,
+        })
+    references: List[Dict[str, Any]] = []
+    if with_refs and ref_index is not None:
+        references = [ref for (_fid, ref) in ref_index.all()]
+    return {
+        "subject": subject,
+        "minutes": agenda.get("minutes"),
+        "sections": out_sections,
+        "references": references,
+    }

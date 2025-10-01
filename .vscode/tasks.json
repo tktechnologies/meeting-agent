@@ -1,0 +1,15 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run meeting-agent API (uvicorn)",
+			"type": "shell",
+			"command": "python -m uvicorn agent.api:app --host 127.0.0.1 --port 8000",
+			"isBackground": false,
+			"problemMatcher": [
+				"$tsc"
+			],
+			"group": "build"
+		}
+	]
+}

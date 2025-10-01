@@ -14,6 +14,114 @@ def _row_to_dict(row) -> Dict[str, Any]:
     return {k: row[k] for k in row.keys()}
 
 
+# --- Reference helpers (normalized refs for bullets) ---
+
+def _make_ref(row: dict) -> dict:
+    """Normalize a DB row/fact-like dict into a Ref structure.
+
+    Ref = {
+      "id": str,
+      "fact_type": str | None,
+      "status": str | None,
+      "updated_at": str | None,
+      "owner": str | None,
+      "source": str | None,
+      "confidence": float | None,
+      "title": str | None,
+      "excerpt": str | None,
+      "url": str | None,
+    }
+    """
+    def _g(k, *alts):
+        for kk in (k, *alts):
+            try:
+                if kk in row and row.get(kk) is not None:
+                    return row.get(kk)
+            except Exception:
+                try:
+                    val = row[kk]
+                    if val is not None:
+                        return val
+                except Exception:
+                    pass
+        return None
+
+    source = _g("source") or _g("fact_type") or _g("type") or None
+    # Try to parse payload for richer fields
+    payload = None
+    try:
+        rawp = _g("payload")
+        if isinstance(rawp, str):
+            payload = json.loads(rawp)
+        elif isinstance(rawp, dict):
+            payload = rawp
+    except Exception:
+        payload = None
+    # Prefer any concise textual field available; include quotes when present
+    excerpt_src = (
+        (payload.get("excerpt") if isinstance(payload, dict) else None) or
+        _g("summary") or _g("text") or _g("content") or _g("quote") or _g("title") or ""
+    )
+    # Provide a longer excerpt so the UI can show a meaningful snippet
+    excerpt = (excerpt_src or "")[:280]
+    # Prefer human-friendly description for titles and headings
+    description = None
+    if isinstance(payload, dict):
+        for k in ("description", "title", "subject", "text", "summary"):
+            v = payload.get(k)
+            if isinstance(v, str) and v.strip():
+                description = v.strip()[:200]
+                break
+    # Robust fallback: derive description from row-level textual fields if payload lacks it
+    if not description:
+        # Try common row fields first
+        desc_src = (
+            _g("title") or _g("summary") or _g("text") or _g("content") or _g("quote") or None
+        )
+        # If still missing, reuse the excerpt source (first sentence) or payload text-like fields
+        if not desc_src:
+            try:
+                if isinstance(payload, dict):
+                    desc_src = (
+                        payload.get("subject") or payload.get("title") or payload.get("summary") or payload.get("text") or None
+                    )
+            except Exception:
+                desc_src = None
+        if isinstance(desc_src, str) and desc_src.strip():
+            s = desc_src.strip()
+            # Pick a concise first sentence/phrase
+            m = re.match(r"^[^.!?\n\r]{1,}", s)
+            description = (m.group(0) if m else s)[:200]
+    return {
+        "id": str(_g("id") or _g("evidence_id") or _g("fact_id") or _g("rowid") or ""),
+        "fact_type": (_g("fact_type") or _g("type") or None),
+        "category": (_g("fact_type") or _g("type") or None),
+        "status": (_g("status") or None),
+        "updated_at": (_g("updated_at") or _g("last_update") or None),
+        "owner": (_g("owner") or _g("who") or _g("assignee") or None),
+        "source": source,
+        "confidence": _g("confidence"),
+        "title": (_g("title") or None),
+        "description": description,
+        "excerpt": (excerpt or None),
+        "url": (_g("url") or _g("link") or None),
+    }
+
+
+def _attach_ref(bullet: dict, row: dict):
+    """Attach a normalized ref for a given row/fact into a bullet under key 'refs'.
+
+    Safely no-ops if there is no useful id/excerpt to reference.
+    """
+    try:
+        r = _make_ref(row)
+    except Exception:
+        return
+    if not r.get("id") and not r.get("excerpt"):
+        return
+    bullet.setdefault("refs", []).append(r)
+
+
 def _parse_payload(raw: Any) -> Dict[str, Any]:
     if isinstance(raw, dict):
         return raw
@@ -25,17 +133,91 @@ def _parse_payload(raw: Any) -> Dict[str, Any]:
     return {}
 
 
-def resolve_org_id(text_or_id: Optional[str]) -> str:
+def resolve_org_id(text_or_id: Optional[str], *, allow_create: bool = True, full_text: Optional[str] = None) -> str:
+    """Resolve an organization id from a user-provided hint.
+
+    Behavior tweaks to avoid accidental org creation:
+    - Try exact match (id or name) and substring match inside full_text first.
+    - Try fuzzy similarity against known org ids/names.
+    - Only auto-create when explicitly allowed AND the candidate looks like a short id (slug-like).
+    - Otherwise fall back to DEFAULT_ORG_ID.
+    """
     candidate = (text_or_id or "").strip()
+
+    def _safe_norm(s: str) -> str:
+        try:
+            import unicodedata, re as _re
+            s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+            s = _re.sub(r"\s+", " ", s)
+            return s.strip().lower()
+        except Exception:
+            return (s or "").strip().lower()
+
+    # 1) direct attempts (exact id or name)
     if candidate:
-        row = db.get_org(candidate)
+        row = db.get_org(candidate) or db.find_org_by_text(candidate)
         if row:
             return row["org_id"]
-        row = db.find_org_by_text(candidate)
-        if row:
-            return row["org_id"]
-        db.ensure_org(candidate, candidate)
-        return candidate
+
+        # 2) fuzzy: look for known org names/ids within the full free text (with boundaries)
+        if full_text:
+            import re as _re
+            hay = f" {_safe_norm(full_text)} "
+            best = None
+            try:
+                orgs = db.list_orgs()
+            except Exception:
+                orgs = []
+
+            def _get(row: Any, key: str) -> Optional[str]:
+                try:
+                    return row[key]
+                except Exception:
+                    try:
+                        return row.get(key)
+                    except Exception:
+                        return None
+
+            for r in orgs:
+                oid = _safe_norm(_get(r, "org_id") or "")
+                name = _safe_norm(_get(r, "name") or "")
+                for k in filter(None, (oid, name)):
+                    # require token boundary to reduce false positives
+                    if f" {k} " in hay:
+                        if best is None or len(k) > len(best[0]):
+                            best = (k, _get(r, "org_id"))
+            if best and best[1]:
+                return str(best[1])
+
+        # 3) fuzzy similarity: compare normalized candidate with known ids/names
+        try:
+            from difflib import SequenceMatcher
+            best_ratio = 0.0
+            best_id: Optional[str] = None
+            cand_norm = _safe_norm(candidate)
+            for r in db.list_orgs():
+                oid = _safe_norm(getattr(r, "org_id", None) or (r.get("org_id") if isinstance(r, dict) else None) or "")
+                name = _safe_norm(getattr(r, "name", None) or (r.get("name") if isinstance(r, dict) else None) or "")
+                for k in filter(None, (oid, name)):
+                    ratio = SequenceMatcher(None, cand_norm, k).ratio()
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        best_id = getattr(r, "org_id", None) or (r.get("org_id") if isinstance(r, dict) else None)
+            # Accept reasonably close matches only
+            if best_id and best_ratio >= 0.82:
+                return str(best_id)
+        except Exception:
+            pass
+
+        # 4) create only if allowed AND the candidate looks like a short, safe id (slug-like)
+        if allow_create:
+            import re as _re
+            # slug-like: letters/digits/_/- only, no spaces, 3..36 chars
+            if _re.fullmatch(r"[A-Za-z0-9_-]{3,36}", candidate):
+                db.ensure_org(candidate, candidate)
+                return candidate
+
+    # 5) Fallback to default org (ensure it exists)
     db.ensure_org(DEFAULT_ORG_ID, DEFAULT_ORG_ID)
     return DEFAULT_ORG_ID
 
@@ -88,6 +270,12 @@ def find_candidates_for_agenda(
     # Keep only vetted facts for agenda planning
     if rows:
         rows = [r for r in rows if (str(r["status"] or "").lower() in {"validated", "published"})]
+    # Fallback: se muito poucos itens vetados, traga alguns 'proposed'
+    MIN_ROWS = 8
+    if rows and len(rows) < MIN_ROWS:
+        recent_all = db.get_recent_facts(org_id, types, limit)
+        proposed = [r for r in recent_all if (str(r["status"] or "").lower() == "proposed")]
+        rows = (rows + proposed)[:limit]
     # Diversify: ensure we have some of each core category to help build sections
     if rows:
         got = {r["fact_type"].lower() for r in rows if r["fact_type"]}
@@ -98,8 +286,12 @@ def find_candidates_for_agenda(
         for t, extra in core_needs:
             if t not in got:
                 extra_rows = db.get_recent_facts(org_id, [t], extra)
-                # filter augmented rows to vetted statuses only
-                extra_rows = [er for er in extra_rows if (str(er["status"] or "").lower() in {"validated", "published"})]
+                # filter vetted; se vazio, cair para proposed
+                vetted = [er for er in extra_rows if (str(er["status"] or "").lower() in {"validated", "published"})]
+                if vetted:
+                    extra_rows = vetted
+                else:
+                    extra_rows = [er for er in extra_rows if (str(er["status"] or "").lower() == "proposed")]
                 augmented.extend(extra_rows)
         # De-duplicate by fact_id preserving order
         seen = set()
@@ -340,6 +532,20 @@ def retrieve_facts_for_subject(org_id: str, subject: str, limit: int = 60, langu
             st = (r.get("status") or "").lower()
         if st in {"validated", "published"} and typ in allowed:
             rows2.append(r)
+    # Fallback: se a lista ficou curta, complete com 'proposed' do mesmo conjunto 'items'
+    if len(rows2) < 6:
+        need = 6 - len(rows2)
+        props = []
+        for r in items:
+            try:
+                typ = (r["fact_type"] or "").lower()
+                st = (r["status"] or "").lower()
+            except Exception:
+                typ = (r.get("fact_type") or "").lower()
+                st = (r.get("status") or "").lower()
+            if st == "proposed" and typ in allowed:
+                props.append(r)
+        rows2.extend(props[:need])
     # Hydrate
     fact_ids = [r["fact_id"] if isinstance(r, dict) else r["fact_id"] for r in rows2]  # type: ignore[index]
     related = _hydrate_related(fact_ids)

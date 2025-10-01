@@ -107,36 +107,35 @@ def _extract_duration_minutes(text: str, lang: str) -> Optional[int]:
 
 
 def _extract_org_hint(text: str) -> Optional[str]:
-    # English: for <org> ... (stop before time hints and about/on)
-    m = re.search(r"(?i)\bfor\s+(.+?)\s*(?=(about|on|,|$|today|tomorrow|next\s+\w+))", text)
-    if m:
-        out = m.group(1).strip().strip(". ")
-        out = re.sub(r"^(?:da|do|de|d’|d'|a|o|as|os)\s+", "", out, flags=re.IGNORECASE)
-        return out
-    # Portuguese: para <org> ...
-    m = re.search(r"(?i)\bpara\s+(.+?)\s*(?=(sobre|,|$|hoje|amanhã|próxima\s+\w+))", text)
-    if m:
-        out = m.group(1).strip().strip(". ")
-        out = re.sub(r"^(?:da|do|de|d’|d'|a|o|as|os)\s+", "", out, flags=re.IGNORECASE)
-        return out
-    # Also accept: agenda <org> ...
-    m = re.search(r"(?i)\bagenda\s+(?:da|do|de)?\s*(.+?)\s*(?=(sobre|about|,|$|hoje|amanhã|today|tomorrow|next\s+\w+))", text)
-    if m:
-        out = m.group(1).strip().strip(". ")
-        out = re.sub(r"^(?:da|do|de|d’|d'|a|o|as|os)\s+", "", out, flags=re.IGNORECASE)
-        return out
-    # Portuguese: com <org> ... (e.g., "reunião com a BYD")
-    m = re.search(r"(?i)\bcom\s+(?:a|o|as|os)?\s*(.+?)\s*(?=(sobre|,|$|hoje|amanhã|próxima\s+\w+))", text)
-    if m:
-        out = m.group(1).strip().strip(". ")
-        out = re.sub(r"^(?:da|do|de|d’|d'|a|o|as|os)\s+", "", out, flags=re.IGNORECASE)
-        return out
-    # English: with <org> ...
-    m = re.search(r"(?i)\bwith\s+(?:the\s+)?(.+?)\s*(?=(about|on|,|$|today|tomorrow|next\s+\w+))", text)
-    if m:
-        out = m.group(1).strip().strip(". ")
-        out = re.sub(r"^(?:the|da|do|de|d’|d'|a|o|as|os)\s+", "", out, flags=re.IGNORECASE)
-        return out
+    """Extract an organization hint from free text.
+
+    Improvements:
+    - Stop at punctuation (. ; : ! ?) and known delimiters to avoid over-capture.
+    - Strip leading articles/prepositions (da, do, de, the, a, o...).
+    - Cap length to avoid capturing entire phrases.
+    """
+    # Common cleaner
+    def _clean(s: str) -> str:
+        s = s.strip().strip(". ")
+        s = re.sub(r"^(?:the|da|do|de|d’|d'|a|o|as|os)\s+", "", s, flags=re.IGNORECASE)
+        # stop at punctuation if present
+        s = re.split(r"[\.;:!?]", s)[0].strip()
+        # cap at ~40 chars to avoid accidental long phrases
+        return s[:40]
+
+    patterns = [
+        r"(?i)\bfor\s+(.+?)\s*(?=(about|on|,|$|today|tomorrow|next\s+\w+|\.|;|:|!|\?))",
+        r"(?i)\bpara\s+(.+?)\s*(?=(sobre|,|$|hoje|amanhã|próxima\s+\w+|\.|;|:|!|\?))",
+        r"(?i)\bagenda\s+(?:da|do|de)?\s*(.+?)\s*(?=(sobre|about|,|$|hoje|amanhã|today|tomorrow|next\s+\w+|\.|;|:|!|\?))",
+        r"(?i)\bcom\s+(?:a|o|as|os)?\s*(.+?)\s*(?=(sobre|,|$|hoje|amanhã|próxima\s+\w+|\.|;|:|!|\?))",
+        r"(?i)\bwith\s+(?:the\s+)?(.+?)\s*(?=(about|on|,|$|today|tomorrow|next\s+\w+|\.|;|:|!|\?))",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            out = _clean(m.group(1))
+            if out:
+                return out
     return None
 
 
@@ -158,6 +157,31 @@ def parse_nl(text: str, defaults: Optional[Dict[str, Any]] = None) -> AgendaNLRe
     org = defaults.get("org_name") or _extract_org_hint(text)
     mt_hint = _extract_meeting_hint(text)
     subject = defaults.get("subject") or _extract_subject(text, lang)
+    # Optional: fuzzy fallback for org when hint is empty or too long
+    if (not org or len(org) >= 20) and text:
+        try:
+            from . import db
+            hay = text.lower()
+            best = None
+            for r in db.list_orgs():
+                def _get(row, key: str):
+                    try:
+                        return row[key]
+                    except Exception:
+                        try:
+                            return row.get(key)
+                        except Exception:
+                            return None
+                for key in (_get(r, "org_id"), _get(r, "name")):
+                    k = ((key or "")).lower()
+                    if k and k in hay:
+                        if best is None or len(k) > len(best[0]):
+                            best = (k, _get(r, "org_id"))
+            if best:
+                org = best[1]
+        except Exception:
+            pass
+
     return AgendaNLRequest(
         text=text,
         org_hint=org,
