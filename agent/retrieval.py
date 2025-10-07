@@ -856,3 +856,552 @@ def synthesize_subject_from_texts(texts: Sequence[str], *, language: str = "en-U
     else:
         phrase = " ".join(top_words[:3])
         return phrase.title()
+
+
+# ---------------------------------------------------------------------------
+# Macro-context retrieval (workstreams layer)
+# ---------------------------------------------------------------------------
+
+def select_workstreams(org_id: str, subject: Optional[str], k: int = 3) -> List[Dict[str, Any]]:
+    """Select top k workstreams for agenda planning.
+    
+    Strategy:
+    1. If subject provided, try exact match in title/tags
+    2. Otherwise, return top workstreams by priority/status/recency
+    """
+    org_id = org_id or DEFAULT_ORG_ID
+    
+    # Try subject-based match first
+    if subject and subject.strip():
+        matches = db.find_workstreams(org_id, subject, limit=k)
+        if matches:
+            return matches
+    
+    # Fallback: top priority workstreams
+    return db.top_workstreams(org_id, limit=k)
+
+
+def search_related_facts(
+    org_id: str,
+    workstreams: List[Dict[str, Any]],
+    per_ws: int = 20,
+) -> List[Dict[str, Any]]:
+    """Widen fact search using workstream tags and titles as keywords.
+    
+    Returns additional facts not already linked to workstreams.
+    """
+    org_id = org_id or DEFAULT_ORG_ID
+    
+    if not workstreams:
+        return []
+    
+    # Build search terms from workstream titles and tags
+    search_terms: set[str] = set()
+    for ws in workstreams:
+        title = ws.get("title", "")
+        if title:
+            # Extract meaningful words from title
+            tokens = re.findall(r"[\wÀ-ÿ]+", title.lower())
+            search_terms.update(t for t in tokens if len(t) >= 4)
+        
+        tags = ws.get("tags") or []
+        for tag in tags:
+            if isinstance(tag, str) and len(tag) >= 3:
+                search_terms.add(tag.lower())
+    
+    if not search_terms:
+        return []
+    
+    # Search for facts matching these terms
+    query = " OR ".join(list(search_terms)[:10])  # Limit to avoid overly broad search
+    
+    try:
+        rows = db.search_facts(
+            org_id,
+            query,
+            ["decision", "open_question", "risk", "action_item", "milestone", "process_step"],
+            limit=per_ws * len(workstreams),
+        )
+    except Exception:
+        return []
+    
+    # Hydrate and convert to candidate format
+    if not rows:
+        return []
+    
+    fact_ids = [row["fact_id"] for row in rows]
+    related = _hydrate_related(fact_ids)
+    evidence_map = related["evidence"]
+    entities_map = related["entities"]
+    
+    candidates: List[Dict[str, Any]] = []
+    for row in rows:
+        row_dict = _row_to_dict(row)
+        payload = _parse_payload(row_dict.get("payload"))
+        fid = row_dict["fact_id"]
+        
+        data = {
+            "fact_id": fid,
+            "org_id": row_dict["org_id"],
+            "meeting_id": row_dict.get("meeting_id"),
+            "transcript_id": row_dict.get("transcript_id"),
+            "fact_type": row_dict["fact_type"],
+            "status": row_dict["status"],
+            "confidence": row_dict.get("confidence"),
+            "payload": payload,
+            "due_iso": row_dict.get("due_iso"),
+            "due_at": row_dict.get("due_at"),
+            "created_at": row_dict.get("created_at"),
+            "updated_at": row_dict.get("updated_at"),
+            "evidence": evidence_map.get(fid, []),
+            "entities": entities_map.get(fid, []),
+        }
+        candidates.append(data)
+    
+    return candidates
+
+
+def rank_micro_facts(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rank facts using a scoring blend of status, urgency, recency, and evidence quality.
+    
+    Returns sorted list with 'score' field added to each item for debugging.
+    """
+    from datetime import datetime, timezone
+    
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    
+    def _score_status(status: str) -> float:
+        """validated=1.0, published=0.95, proposed=0.6, draft=0.4"""
+        s = (status or "").lower()
+        return {
+            "validated": 1.0,
+            "published": 0.95,
+            "proposed": 0.6,
+            "draft": 0.4,
+        }.get(s, 0.3)
+    
+    def _score_urgency(due_iso: Optional[str]) -> float:
+        """Due soon = higher score. No due = low baseline."""
+        if not due_iso:
+            return 0.2
+        try:
+            due = datetime.fromisoformat(due_iso.replace("Z", "+00:00"))
+            delta_days = (due - now).total_seconds() / 86400.0
+            if delta_days <= 0:
+                return 1.0  # Overdue
+            if delta_days <= 3:
+                return 0.9
+            if delta_days <= 7:
+                return 0.7
+            if delta_days <= 14:
+                return 0.5
+            return 0.3
+        except Exception:
+            return 0.2
+    
+    def _score_recency(created_at: Optional[str]) -> float:
+        """Recent facts score higher."""
+        if not created_at:
+            return 0.3
+        try:
+            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            delta_days = (now - created).total_seconds() / 86400.0
+            # Decay over 30 days
+            return max(0.2, 1.0 - (delta_days / 30.0))
+        except Exception:
+            return 0.3
+    
+    def _score_evidence(evidence: List[Any]) -> float:
+        """More evidence with quotes = higher score."""
+        if not evidence:
+            return 0.3
+        quote_count = sum(1 for e in evidence if e.get("quote") and len(str(e.get("quote")).strip()) > 20)
+        return min(1.0, 0.4 + (quote_count * 0.2))
+    
+    def _score_type(fact_type: str) -> float:
+        """Weight fact types by importance for agenda planning."""
+        ft = (fact_type or "").lower()
+        return {
+            "decision": 1.0,
+            "open_question": 0.9,
+            "risk": 0.95,
+            "action_item": 0.85,
+            "milestone": 0.9,
+            "process_step": 0.7,
+        }.get(ft, 0.5)
+    
+    for item in items:
+        status_score = _score_status(item.get("status"))
+        urgency_score = _score_urgency(item.get("due_iso"))
+        recency_score = _score_recency(item.get("created_at"))
+        evidence_score = _score_evidence(item.get("evidence", []))
+        type_score = _score_type(item.get("fact_type"))
+        
+        # Weighted blend
+        score = (
+            0.35 * status_score +
+            0.25 * urgency_score +
+            0.15 * recency_score +
+            0.15 * evidence_score +
+            0.10 * type_score
+        )
+        
+        item["score"] = round(score, 4)
+    
+    # Sort by score descending, then by created_at descending for ties
+    items.sort(
+        key=lambda x: (-x.get("score", 0), x.get("created_at") or ""),
+        reverse=False,
+    )
+    
+    return items
+
+
+def facts_for_workstreams(
+    org_id: str,
+    workstreams: List[Dict[str, Any]],
+    per_ws: int = 20,
+) -> List[Dict[str, Any]]:
+    """Get facts for workstreams combining linked facts and widened search.
+    
+    Returns ranked and deduplicated fact list.
+    """
+    org_id = org_id or DEFAULT_ORG_ID
+    
+    if not workstreams:
+        return []
+    
+    # Get directly linked facts
+    ws_ids = [ws["workstream_id"] for ws in workstreams]
+    linked = db.get_facts_by_workstreams(ws_ids, limit_per_ws=per_ws)
+    
+    # Get widened facts from search
+    widened = search_related_facts(org_id, workstreams, per_ws=per_ws)
+    
+    # Combine and deduplicate by fact_id
+    seen_ids: set[str] = set()
+    combined: List[Dict[str, Any]] = []
+    
+    for fact in linked + widened:
+        fid = fact.get("fact_id")
+        if fid and fid not in seen_ids:
+            seen_ids.add(fid)
+            combined.append(fact)
+    
+    # Auto-tag facts with workstream_id from their meeting
+    combined = enrich_facts_with_meeting_workstreams(combined)
+    
+    # Rank all facts
+    ranked = rank_micro_facts(combined)
+    
+    return ranked
+
+
+def enrich_facts_with_meeting_workstreams(facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Enrich facts with workstream_id inherited from their meeting.
+    
+    If a fact doesn't have a workstream_id but its meeting is linked to workstreams,
+    use the first (highest priority) workstream from that meeting.
+    """
+    # Group facts by meeting_id
+    from collections import defaultdict
+    by_meeting: dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    
+    for fact in facts:
+        meeting_id = fact.get("meeting_id")
+        if meeting_id and not fact.get("workstream_id"):
+            by_meeting[meeting_id].append(fact)
+    
+    if not by_meeting:
+        return facts
+    
+    # Fetch workstreams for each meeting
+    meeting_ws_cache: dict[str, List[Dict[str, Any]]] = {}
+    for meeting_id in by_meeting.keys():
+        workstreams = db.get_meeting_workstreams(meeting_id)
+        if workstreams:
+            meeting_ws_cache[meeting_id] = workstreams
+    
+    # Enrich facts
+    for fact in facts:
+        if fact.get("workstream_id"):
+            continue  # Already has workstream
+        
+        meeting_id = fact.get("meeting_id")
+        if meeting_id and meeting_id in meeting_ws_cache:
+            workstreams = meeting_ws_cache[meeting_id]
+            if workstreams:
+                # Use first (highest priority) workstream
+                fact["workstream_id"] = workstreams[0]["workstream_id"]
+                fact["_inherited_from_meeting"] = True
+    
+    return facts
+
+
+# --- Smart Fact Selection (forward-looking, actionable facts) ---
+
+def select_actionable_facts(
+    org_id: str,
+    subject: str,
+    intent: str,
+    workstreams: List[Dict[str, Any]],
+    language: str = "pt-BR",
+    limit: int = 40,
+) -> List[Dict[str, Any]]:
+    """Select facts that NEED to be addressed in this meeting.
+    
+    Priority logic:
+    1. URGENT: Overdue actions, red-status items, blockers
+    2. DECISION-NEEDED: Open decisions tagged as "needs approval"
+    3. WORKSTREAM-DRIVEN: Facts linked to workstreams with upcoming deadlines
+    4. SUBJECT-RELEVANT: Facts matching subject keywords
+    5. RECENT-CONTEXT: Latest validated facts for background (max 20%)
+    
+    Returns ranked list with 'urgency_score' and 'why_relevant' fields.
+    """
+    org_id = org_id or DEFAULT_ORG_ID
+    
+    # Step 1: Get candidates from multiple sources
+    urgent_facts = get_urgent_facts(org_id, workstreams)
+    decision_facts = get_decision_needed_facts(org_id, workstreams)
+    subject_facts = retrieve_facts_for_subject(org_id, subject, limit=30, language=language) if subject else []
+    workstream_facts = facts_for_workstreams(org_id, workstreams, per_ws=10) if workstreams else []
+    
+    # Step 2: Deduplicate
+    seen_ids: set[str] = set()
+    all_facts: List[Dict[str, Any]] = []
+    
+    for fact_list in [urgent_facts, decision_facts, subject_facts, workstream_facts]:
+        for fact in fact_list:
+            fid = fact.get("fact_id")
+            if fid and fid not in seen_ids:
+                seen_ids.add(fid)
+                all_facts.append(fact)
+    
+    if not all_facts:
+        return []
+    
+    # Step 3: Score each fact for relevance to THIS meeting
+    for fact in all_facts:
+        fact["urgency_score"] = calculate_urgency(fact)
+        fact["why_relevant"] = generate_relevance_reason(fact, subject, intent, workstreams, language)
+    
+    # Step 4: Rank by urgency
+    ranked = sorted(all_facts, key=lambda f: f.get("urgency_score", 0), reverse=True)
+    
+    # Step 5: Balance (don't return only urgent items; include context)
+    urgent = [f for f in ranked if f.get("urgency_score", 0) > 0.7][:15]
+    important = [f for f in ranked if 0.4 <= f.get("urgency_score", 0) <= 0.7][:15]
+    context = [f for f in ranked if f.get("urgency_score", 0) < 0.4][:10]
+    
+    result = urgent + important + context
+    return result[:limit]
+
+
+def get_urgent_facts(org_id: str, workstreams: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Get urgent facts: overdue, blockers, red status."""
+    org_id = org_id or DEFAULT_ORG_ID
+    
+    # Get recent facts with urgent types and convert to dicts
+    urgent_types = ["blocker", "risk", "decision_needed", "action_item"]
+    fact_rows = db.get_recent_facts(org_id, urgent_types, limit=50)
+    facts = [_row_to_dict(f) for f in fact_rows]
+    
+    # Filter to urgent items
+    urgent = []
+    from datetime import datetime, timezone
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    
+    for fact in facts:
+        # Check if overdue
+        due_iso = fact.get("due_iso") or fact.get("due_at")
+        is_overdue = False
+        if due_iso:
+            try:
+                due = datetime.fromisoformat(due_iso.replace("Z", "+00:00"))
+                is_overdue = due < now
+            except Exception:
+                pass
+        
+        # Check status
+        status = (fact.get("status") or "").lower()
+        
+        # Include if overdue, red status, or blocker type
+        if is_overdue or status == "red" or fact.get("fact_type") == "blocker":
+            urgent.append(fact)
+    
+    return urgent
+
+
+def get_decision_needed_facts(org_id: str, workstreams: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Get facts that need decisions."""
+    org_id = org_id or DEFAULT_ORG_ID
+    
+    # Get decision-related facts and convert to dicts
+    decision_types = ["decision_needed", "decision", "open_question"]
+    fact_rows = db.get_recent_facts(org_id, decision_types, limit=30)
+    facts = [_row_to_dict(f) for f in fact_rows]
+    
+    # Filter to validated/published only
+    validated = [
+        f for f in facts
+        if (f.get("status") or "").lower() in {"validated", "published"}
+    ]
+    
+    return validated
+
+
+def calculate_urgency(fact: Dict[str, Any]) -> float:
+    """Score 0-1 based on how urgently this needs discussion.
+    
+    Factors:
+    - Overdue: +0.5
+    - Red status: +0.3
+    - Yellow status: +0.2
+    - Blocker/risk type: +0.2
+    - Action/milestone type: +0.1
+    - Age >30 days: +0.2
+    - Age >14 days: +0.1
+    """
+    from datetime import datetime, timezone
+    
+    score = 0.0
+    
+    # Check overdue
+    due_iso = fact.get("due_iso") or fact.get("due_at")
+    if due_iso:
+        try:
+            due = datetime.fromisoformat(due_iso.replace("Z", "+00:00"))
+            now = datetime.utcnow().replace(tzinfo=timezone.utc)
+            if due < now:
+                score += 0.5
+        except Exception:
+            pass
+    
+    # Status
+    status = (fact.get("status") or "").lower()
+    if status == "red":
+        score += 0.3
+    elif status == "yellow":
+        score += 0.2
+    
+    # Type
+    ftype = (fact.get("fact_type") or "").lower()
+    if ftype in ["blocker", "decision_needed", "risk"]:
+        score += 0.2
+    elif ftype in ["action_item", "milestone"]:
+        score += 0.1
+    
+    # Age
+    created_at = fact.get("created_at")
+    if created_at:
+        try:
+            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            now = datetime.utcnow().replace(tzinfo=timezone.utc)
+            age_days = (now - created).total_seconds() / 86400
+            if age_days > 30:
+                score += 0.2
+            elif age_days > 14:
+                score += 0.1
+        except Exception:
+            pass
+    
+    return min(1.0, score)
+
+
+def generate_relevance_reason(
+    fact: Dict[str, Any],
+    subject: str,
+    intent: str,
+    workstreams: List[Dict[str, Any]],
+    language: str = "pt-BR",
+) -> str:
+    """Generate 1-sentence reason why this fact is relevant to THIS meeting.
+    
+    Examples:
+    - "Decisão pendente há 21 dias sobre integração com API"
+    - "Bloqueador crítico impactando lançamento do Song Plus"
+    - "Meta de Q1 com deadline em 15 dias"
+    """
+    from datetime import datetime, timezone
+    
+    parts = []
+    ftype = (fact.get("fact_type") or "").lower()
+    status = (fact.get("status") or "").lower()
+    
+    # Parse payload if it's a string
+    payload = fact.get("payload") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = {}
+    
+    # Add type description
+    if language == "pt-BR":
+        type_names = {
+            "blocker": "Bloqueador",
+            "risk": "Risco",
+            "decision_needed": "Decisão pendente",
+            "decision": "Decisão",
+            "action_item": "Ação",
+            "milestone": "Marco",
+            "open_question": "Questão aberta",
+        }
+    else:
+        type_names = {
+            "blocker": "Blocker",
+            "risk": "Risk",
+            "decision_needed": "Decision needed",
+            "decision": "Decision",
+            "action_item": "Action",
+            "milestone": "Milestone",
+            "open_question": "Open question",
+        }
+    
+    type_label = type_names.get(ftype, ftype.replace("_", " ").capitalize())
+    
+    # Add urgency indicator
+    if status == "red":
+        urgency = "crítico" if language == "pt-BR" else "critical"
+        type_label = f"{type_label} {urgency}"
+    
+    parts.append(type_label)
+    
+    # Add age if old
+    created_at = fact.get("created_at")
+    if created_at:
+        try:
+            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            now = datetime.utcnow().replace(tzinfo=timezone.utc)
+            age_days = int((now - created).total_seconds() / 86400)
+            if age_days > 14:
+                age_text = f"há {age_days} dias" if language == "pt-BR" else f"{age_days} days old"
+                parts.append(age_text)
+        except Exception:
+            pass
+    
+    # Add subject/title
+    subject_text = (
+        payload.get("subject") or
+        payload.get("title") or
+        payload.get("name") or
+        ""
+    )
+    if subject_text:
+        # Truncate
+        if len(subject_text) > 50:
+            subject_text = subject_text[:47] + "..."
+        parts.append(f"sobre {subject_text}" if language == "pt-BR" else f"about {subject_text}")
+    
+    # Add workstream if relevant
+    ws_id = fact.get("workstream_id")
+    if ws_id and workstreams:
+        ws = next((w for w in workstreams if w.get("workstream_id") == ws_id), None)
+        if ws:
+            ws_title = ws.get("title", "")
+            if ws_title:
+                parts.append(f"({ws_title})")
+    
+    return " ".join(parts) if parts else type_label
+

@@ -3,9 +3,9 @@ import json
 from typing import Any, Dict, List, Optional, Sequence
 import re
 
-from . import db
-from . import retrieval
-from .config import DEFAULT_ORG_ID
+from .. import db
+from .. import retrieval
+from ..config import DEFAULT_ORG_ID
 
 
 DEFAULT_FACT_TYPES = (
@@ -881,3 +881,320 @@ def persist_agenda_proposal(
     fact_id = db.insert_or_update_fact(fact)
     proposal["idempotency_key"] = idem
     return fact_id
+
+
+# ---------------------------------------------------------------------------
+# Macro-aware planning (workstreams → facts → agenda)
+# ---------------------------------------------------------------------------
+
+def plan_agenda_from_workstreams(
+    org_id: str,
+    workstreams: List[Dict[str, Any]],
+    facts: List[Dict[str, Any]],
+    duration_minutes: int,
+    language: str,
+) -> Dict[str, Any]:
+    """Build rich agenda using workstream context and facts.
+    
+    Uses existing subject-centered planning logic enriched with workstream metadata.
+    Returns agenda with _metadata v2.0 including workstreams and refs.
+    """
+    org_id = org_id or DEFAULT_ORG_ID
+    
+    # Build subject from workstream titles
+    if workstreams:
+        if len(workstreams) == 1:
+            subject = workstreams[0].get("title", "")
+        else:
+            # Combine top workstream titles
+            titles = [ws.get("title", "") for ws in workstreams[:3] if ws.get("title")]
+            subject = ", ".join(titles) if titles else None
+    else:
+        subject = None
+    
+    # Use existing subject-centered planning with enriched facts
+    if facts and subject:
+        # Call the proven planning logic
+        proposal = _plan_agenda_subject_centered(
+            org_id,
+            subject,
+            facts,  # Pass facts as candidates
+            company_context=None,
+            duration_minutes=duration_minutes,
+            language=language,
+        )
+    else:
+        # Fallback to next-meeting planning
+        proposal = plan_agenda_next(
+            org_id,
+            subject,
+            facts,
+            company_context=None,
+            duration_minutes=duration_minutes,
+            language=language,
+        )
+    
+    # Enrich with workstream metadata v2.0
+    agenda = proposal.get("agenda", {})
+    if "_metadata" not in agenda:
+        agenda["_metadata"] = {}
+    
+    metadata = agenda["_metadata"]
+    metadata["agenda_v"] = "2.0"
+    metadata["workstreams"] = [
+        {
+            "workstream_id": ws["workstream_id"],
+            "title": ws.get("title", ""),
+            "status": ws.get("status", "green"),
+            "priority": ws.get("priority", 1),
+        }
+        for ws in workstreams
+    ]
+    
+    # Build refs from facts
+    refs = []
+    for fact in facts:
+        evidence = fact.get("evidence") or []
+        why_quote = ""
+        if evidence:
+            for ev in evidence:
+                q = ev.get("quote", "")
+                if isinstance(q, str) and len(q.strip()) > 20:
+                    why_quote = q.strip()[:150]
+                    break
+        
+        refs.append({
+            "fact_id": fact.get("fact_id"),
+            "type": fact.get("fact_type"),
+            "status": fact.get("status"),
+            "quote": why_quote,
+            "workstream_id": fact.get("workstream_id"),
+        })
+    
+    metadata["refs"] = refs
+    proposal["agenda"] = agenda
+    
+    return proposal
+    
+    # Group facts by workstream
+    ws_facts: Dict[str, List[Dict[str, Any]]] = {}
+    unassigned_facts: List[Dict[str, Any]] = []
+    
+    for fact in facts:
+        ws_id = fact.get("workstream_id")
+        if ws_id:
+            ws_facts.setdefault(ws_id, []).append(fact)
+        else:
+            unassigned_facts.append(fact)
+    
+    # Build sections by workstream
+    sections: List[Dict[str, Any]] = []
+    all_refs: List[Dict[str, Any]] = []
+    
+    # Allocate time per workstream weighted by fact count and priority
+    ws_weights: Dict[str, float] = {}
+    for ws in workstreams:
+        ws_id = ws["workstream_id"]
+        fact_count = len(ws_facts.get(ws_id, []))
+        priority = ws.get("priority", 1)
+        ws_weights[ws_id] = priority * (1 + min(fact_count, 10) * 0.5)
+    
+    total_weight = sum(ws_weights.values()) or 1.0
+    ws_minutes: Dict[str, int] = {}
+    for ws in workstreams:
+        ws_id = ws["workstream_id"]
+        allocated = max(10, int(duration_minutes * (ws_weights[ws_id] / total_weight)))
+        ws_minutes[ws_id] = allocated
+    
+    # Adjust to fit duration
+    total_allocated = sum(ws_minutes.values())
+    if total_allocated != duration_minutes and ws_minutes:
+        diff = duration_minutes - total_allocated
+        # Distribute diff to workstreams proportionally
+        sorted_ws = sorted(ws_minutes.keys(), key=lambda k: ws_minutes[k], reverse=True)
+        i = 0
+        while diff != 0 and sorted_ws:
+            ws_id = sorted_ws[i % len(sorted_ws)]
+            if diff > 0:
+                ws_minutes[ws_id] += 1
+                diff -= 1
+            elif ws_minutes[ws_id] > 10:
+                ws_minutes[ws_id] -= 1
+                diff += 1
+            else:
+                i += 1
+                if i >= len(sorted_ws) * 2:
+                    break
+            i += 1
+    
+    # Build section for each workstream
+    for ws in workstreams:
+        ws_id = ws["workstream_id"]
+        ws_title = ws.get("title", "")
+        ws_status = ws.get("status", "green")
+        ws_facts_list = ws_facts.get(ws_id, [])
+        
+        if not ws_facts_list:
+            # Empty workstream - add placeholder section
+            sections.append({
+                "title": ws_title,
+                "minutes": ws_minutes.get(ws_id, 10),
+                "items": [],
+                "workstream_id": ws_id,
+            })
+            continue
+        
+        # Categorize facts into subsections
+        goals: List[Dict[str, Any]] = []
+        decisions: List[Dict[str, Any]] = []
+        risks: List[Dict[str, Any]] = []
+        actions: List[Dict[str, Any]] = []
+        
+        for fact in ws_facts_list:
+            ftype = (fact.get("fact_type") or "").lower()
+            payload = fact.get("payload") or {}
+            evidence = fact.get("evidence") or []
+            
+            # Extract best quote for 'why'
+            why_quote = ""
+            if evidence:
+                for ev in evidence:
+                    q = ev.get("quote", "")
+                    if isinstance(q, str) and len(q.strip()) > 20:
+                        why_quote = q.strip()[:150]
+                        break
+            
+            # Build bullet text
+            text = _short_text_from_payload(payload) or ""
+            if not text and evidence:
+                text = why_quote[:80] if why_quote else ""
+            
+            if not text:
+                continue
+            
+            # Build why justification
+            why = ""
+            if why_quote:
+                if language == "pt-BR":
+                    why = f"(evidência: {why_quote[:100]}...)"
+                else:
+                    why = f"(evidence: {why_quote[:100]}...)"
+            
+            bullet = {
+                "text": text,
+                "why": why,
+                "owner": payload.get("owner"),
+                "due": fact.get("due_iso") or fact.get("due_at"),
+            }
+            
+            # Add ref
+            ref = {
+                "fact_id": fact.get("fact_id"),
+                "type": ftype,
+                "status": fact.get("status"),
+                "quote": why_quote,
+                "char_span": evidence[0].get("char_span") if evidence else None,
+                "workstream_id": ws_id,
+            }
+            all_refs.append(ref)
+            
+            # Categorize
+            if ftype in {"milestone", "objective", "metric"}:
+                goals.append(bullet)
+            elif ftype in {"decision", "decision_needed"}:
+                decisions.append(bullet)
+            elif ftype in {"risk", "blocker"}:
+                risks.append(bullet)
+            elif ftype in {"action_item", "task", "process_step"}:
+                actions.append(bullet)
+            else:
+                # Default to actions
+                actions.append(bullet)
+        
+        # Cap items per subsection to fit time budget
+        max_items_per = max(2, ws_minutes.get(ws_id, 10) // 5)
+        
+        section_items: List[Dict[str, Any]] = []
+        if goals:
+            section_items.append({
+                "heading": "Metas" if language == "pt-BR" else "Goals",
+                "bullets": goals[:max_items_per],
+            })
+        if decisions:
+            section_items.append({
+                "heading": "Decisões" if language == "pt-BR" else "Decisions",
+                "bullets": decisions[:max_items_per],
+            })
+        if risks:
+            section_items.append({
+                "heading": "Riscos" if language == "pt-BR" else "Risks",
+                "bullets": risks[:max_items_per],
+            })
+        if actions:
+            section_items.append({
+                "heading": "Ações" if language == "pt-BR" else "Actions",
+                "bullets": actions[:max_items_per],
+            })
+        
+        sections.append({
+            "title": ws_title,
+            "minutes": ws_minutes.get(ws_id, 10),
+            "items": section_items,
+            "workstream_id": ws_id,
+        })
+    
+    # Build title
+    if len(workstreams) == 1:
+        title = f"Reunião: {workstreams[0].get('title', '')}" if language == "pt-BR" else f"Meeting: {workstreams[0].get('title', '')}"
+    else:
+        org_name = db.get_org(org_id)
+        org_display = org_name["name"] if org_name else org_id
+        title = f"Top prioridades {org_display}" if language == "pt-BR" else f"Top priorities {org_display}"
+    
+    # Build metadata v2.0
+    metadata = {
+        "agenda_v": "2.0",
+        "workstreams": [
+            {
+                "workstream_id": ws["workstream_id"],
+                "title": ws.get("title", ""),
+                "status": ws.get("status", "green"),
+                "priority": ws.get("priority", 1),
+            }
+            for ws in workstreams
+        ],
+        "sections": sections,
+        "refs": all_refs,
+    }
+    
+    # Check for stale workstreams (not updated in 14 days)
+    from datetime import datetime, timedelta, timezone
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    stale_count = 0
+    for ws in workstreams:
+        updated_at = ws.get("updated_at")
+        if updated_at:
+            try:
+                updated = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                if (now - updated) > timedelta(days=14):
+                    stale_count += 1
+            except Exception:
+                pass
+    
+    if stale_count > 0:
+        metadata["health"] = "stale_macro"
+    
+    agenda = {
+        "title": title,
+        "minutes": duration_minutes,
+        "sections": sections,
+        "_metadata": metadata,
+    }
+    
+    return {
+        "agenda": agenda,
+        "choice": "macro",
+        "reason": "workstream-driven planning",
+        "subject": {"query": None, "coverage": 1.0 if sections else 0.0, "facts": len(facts)},
+        "supporting_fact_ids": [f.get("fact_id") for f in facts if f.get("fact_id")],
+    }

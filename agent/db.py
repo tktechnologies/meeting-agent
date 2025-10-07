@@ -136,6 +136,54 @@ CREATE VIRTUAL TABLE IF NOT EXISTS global_context_fts USING fts5(
     context_id UNINDEXED,
     content
 );
+
+-- workstreams (macro-level context)
+CREATE TABLE IF NOT EXISTS workstreams (
+    workstream_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL DEFAULT 'green',
+    priority INTEGER NOT NULL DEFAULT 1,
+    owner TEXT,
+    start_iso TEXT,
+    target_iso TEXT,
+    tags TEXT,
+    updated_at DATETIME NOT NULL,
+    created_at DATETIME NOT NULL,
+    FOREIGN KEY (org_id) REFERENCES orgs(org_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_workstreams_org_priority ON workstreams(org_id, priority DESC, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_workstreams_org_status ON workstreams(org_id, status, priority DESC);
+
+-- workstream-fact links
+CREATE TABLE IF NOT EXISTS workstream_facts (
+    workstream_id TEXT NOT NULL,
+    fact_id TEXT NOT NULL,
+    weight REAL NOT NULL DEFAULT 1.0,
+    created_at DATETIME NOT NULL,
+    PRIMARY KEY (workstream_id, fact_id),
+    FOREIGN KEY (workstream_id) REFERENCES workstreams(workstream_id) ON DELETE CASCADE,
+    FOREIGN KEY (fact_id) REFERENCES facts(fact_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_workstream_facts_ws ON workstream_facts(workstream_id);
+CREATE INDEX IF NOT EXISTS idx_workstream_facts_fact ON workstream_facts(fact_id);
+
+-- account snapshots (optional macro overview)
+CREATE TABLE IF NOT EXISTS account_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL,
+    as_of_iso TEXT NOT NULL,
+    summary TEXT,
+    top_workstreams TEXT,
+    metrics TEXT,
+    created_at DATETIME NOT NULL,
+    FOREIGN KEY (org_id) REFERENCES orgs(org_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_account_snapshots_org_date ON account_snapshots(org_id, as_of_iso DESC);
 """
 
 
@@ -232,6 +280,107 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             context_id UNINDEXED,
             content
         )
+        """
+    )
+    # Ensure workstream tables exist (macro layer)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workstreams (
+            workstream_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            status TEXT NOT NULL DEFAULT 'green',
+            priority INTEGER NOT NULL DEFAULT 1,
+            owner TEXT,
+            start_iso TEXT,
+            target_iso TEXT,
+            tags TEXT,
+            updated_at DATETIME NOT NULL,
+            created_at DATETIME NOT NULL,
+            FOREIGN KEY (org_id) REFERENCES orgs(org_id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_workstreams_org_priority 
+        ON workstreams(org_id, priority DESC, updated_at DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_workstreams_org_status 
+        ON workstreams(org_id, status, priority DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workstream_facts (
+            workstream_id TEXT NOT NULL,
+            fact_id TEXT NOT NULL,
+            weight REAL NOT NULL DEFAULT 1.0,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY (workstream_id, fact_id),
+            FOREIGN KEY (workstream_id) REFERENCES workstreams(workstream_id) ON DELETE CASCADE,
+            FOREIGN KEY (fact_id) REFERENCES facts(fact_id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_workstream_facts_ws 
+        ON workstream_facts(workstream_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_workstream_facts_fact 
+        ON workstream_facts(fact_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS account_snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            as_of_iso TEXT NOT NULL,
+            summary TEXT,
+            top_workstreams TEXT,
+            metrics TEXT,
+            created_at DATETIME NOT NULL,
+            FOREIGN KEY (org_id) REFERENCES orgs(org_id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_account_snapshots_org_date 
+        ON account_snapshots(org_id, as_of_iso DESC)
+        """
+    )
+    # Meeting-Workstream linking (many-to-many)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS meeting_workstreams (
+            meeting_id TEXT NOT NULL,
+            workstream_id TEXT NOT NULL,
+            linked_at DATETIME NOT NULL,
+            PRIMARY KEY (meeting_id, workstream_id),
+            FOREIGN KEY (workstream_id) REFERENCES workstreams(workstream_id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_meeting_workstreams_meeting 
+        ON meeting_workstreams(meeting_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_meeting_workstreams_ws 
+        ON meeting_workstreams(workstream_id)
         """
     )
 
@@ -610,6 +759,25 @@ def search_facts(org_id: str, query: Optional[str], types: Optional[Sequence[str
         return conn.execute(sql, params).fetchall()
 
 
+def get_facts_by_ids(fact_ids: List[str]) -> List[sqlite3.Row]:
+    """
+    Retrieve multiple facts by their IDs.
+    
+    Args:
+        fact_ids: List of fact IDs to retrieve
+        
+    Returns:
+        List of fact rows
+    """
+    if not fact_ids:
+        return []
+    
+    with tx(readonly=True) as conn:
+        placeholders = ",".join("?" for _ in fact_ids)
+        sql = f"SELECT * FROM facts WHERE fact_id IN ({placeholders})"
+        return conn.execute(sql, fact_ids).fetchall()
+
+
 def get_recent_facts(org_id: str, types: Optional[Sequence[str]] = None, limit: int = 100) -> List[sqlite3.Row]:
     org_id = org_id or DEFAULT_ORG_ID
     with tx(readonly=True) as conn:
@@ -767,3 +935,432 @@ def get_global_context(context_id: str = "default") -> Optional[sqlite3.Row]:
             (context_id,),
         ).fetchone()
         return row
+
+
+# ---------------------------------------------------------------------------
+# Workstream DAO (macro-context layer)
+# ---------------------------------------------------------------------------
+
+def upsert_workstream(ws: Dict[str, Any]) -> Dict[str, Any]:
+    """Create or update a workstream. Returns the full workstream dict."""
+    workstream_id = ws.get("workstream_id") or secrets.token_hex(16)
+    org_id = ws.get("org_id")
+    if not org_id:
+        raise ValueError("org_id is required for workstream")
+    ensure_org(org_id)
+    
+    title = ws.get("title") or ""
+    if not title.strip():
+        raise ValueError("title is required for workstream")
+    
+    status = ws.get("status", "green").lower()
+    if status not in {"green", "yellow", "red"}:
+        raise ValueError(f"Invalid status '{status}'; must be green|yellow|red")
+    
+    priority = int(ws.get("priority", 1))
+    tags = ws.get("tags") or []
+    tags_json = json.dumps(tags) if tags else None
+    
+    now = now_iso()
+    
+    with tx() as conn:
+        # Check if exists
+        existing = conn.execute(
+            "SELECT workstream_id FROM workstreams WHERE workstream_id=?",
+            (workstream_id,),
+        ).fetchone()
+        
+        if existing:
+            conn.execute(
+                """
+                UPDATE workstreams SET
+                    title=?, description=?, status=?, priority=?, owner=?,
+                    start_iso=?, target_iso=?, tags=?, updated_at=?
+                WHERE workstream_id=?
+                """,
+                (
+                    title,
+                    ws.get("description"),
+                    status,
+                    priority,
+                    ws.get("owner"),
+                    ws.get("start_iso"),
+                    ws.get("target_iso"),
+                    tags_json,
+                    now,
+                    workstream_id,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO workstreams(
+                    workstream_id, org_id, title, description, status, priority,
+                    owner, start_iso, target_iso, tags, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    workstream_id,
+                    org_id,
+                    title,
+                    ws.get("description"),
+                    status,
+                    priority,
+                    ws.get("owner"),
+                    ws.get("start_iso"),
+                    ws.get("target_iso"),
+                    tags_json,
+                    now,
+                    now,
+                ),
+            )
+    
+    # Return full workstream
+    with tx(readonly=True) as conn:
+        row = conn.execute(
+            "SELECT * FROM workstreams WHERE workstream_id=?",
+            (workstream_id,),
+        ).fetchone()
+        result = {k: row[k] for k in row.keys()}
+        if result.get("tags"):
+            try:
+                result["tags"] = json.loads(result["tags"])
+            except Exception:
+                result["tags"] = []
+        return result
+
+
+def list_workstreams(
+    org_id: str,
+    status: Optional[str] = None,
+    min_priority: int = 0,
+) -> List[Dict[str, Any]]:
+    """List workstreams for an org, optionally filtered by status and min priority."""
+    org_id = org_id or DEFAULT_ORG_ID
+    
+    with tx(readonly=True) as conn:
+        params: List[Any] = [org_id, min_priority]
+        sql = """
+            SELECT * FROM workstreams
+            WHERE org_id=? AND priority >= ?
+        """
+        
+        if status:
+            sql += " AND status=?"
+            params.append(status.lower())
+        
+        sql += " ORDER BY priority DESC, updated_at DESC"
+        
+        rows = conn.execute(sql, params).fetchall()
+        result = []
+        for row in rows:
+            ws = {k: row[k] for k in row.keys()}
+            if ws.get("tags"):
+                try:
+                    ws["tags"] = json.loads(ws["tags"])
+                except Exception:
+                    ws["tags"] = []
+            result.append(ws)
+        return result
+
+
+def find_workstreams(
+    org_id: str,
+    subject: str,
+    limit: int = 3,
+) -> List[Dict[str, Any]]:
+    """Find workstreams matching subject in title or tags."""
+    org_id = org_id or DEFAULT_ORG_ID
+    needle = (subject or "").strip().lower()
+    
+    if not needle:
+        return []
+    
+    with tx(readonly=True) as conn:
+        # Match in title or tags (JSON array)
+        rows = conn.execute(
+            """
+            SELECT * FROM workstreams
+            WHERE org_id=? AND (
+                LOWER(title) LIKE ?
+                OR LOWER(tags) LIKE ?
+            )
+            ORDER BY priority DESC, updated_at DESC
+            LIMIT ?
+            """,
+            (org_id, f"%{needle}%", f"%{needle}%", limit),
+        ).fetchall()
+        
+        result = []
+        for row in rows:
+            ws = {k: row[k] for k in row.keys()}
+            if ws.get("tags"):
+                try:
+                    ws["tags"] = json.loads(ws["tags"])
+                except Exception:
+                    ws["tags"] = []
+            result.append(ws)
+        return result
+
+
+def link_facts(
+    workstream_id: str,
+    fact_ids: List[str],
+    weight: float = 1.0,
+) -> int:
+    """Link facts to a workstream. Returns count of new links created."""
+    if not fact_ids:
+        return 0
+    
+    now = now_iso()
+    count = 0
+    
+    with tx() as conn:
+        for fid in fact_ids:
+            # Insert or ignore
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO workstream_facts(workstream_id, fact_id, weight, created_at)
+                    VALUES(?, ?, ?, ?)
+                    """,
+                    (workstream_id, fid, weight, now),
+                )
+                count += 1
+            except sqlite3.IntegrityError:
+                # Already linked; update weight
+                conn.execute(
+                    """
+                    UPDATE workstream_facts SET weight=?
+                    WHERE workstream_id=? AND fact_id=?
+                    """,
+                    (weight, workstream_id, fid),
+                )
+    
+    return count
+
+
+def get_facts_by_workstreams(
+    workstream_ids: List[str],
+    limit_per_ws: int = 20,
+) -> List[Dict[str, Any]]:
+    """Get facts linked to workstreams, hydrated with evidence and entities."""
+    if not workstream_ids:
+        return []
+    
+    placeholders = ",".join("?" for _ in workstream_ids)
+    
+    with tx(readonly=True) as conn:
+        sql = f"""
+            SELECT DISTINCT f.*, wf.workstream_id, wf.weight
+            FROM facts f
+            JOIN workstream_facts wf ON wf.fact_id = f.fact_id
+            WHERE wf.workstream_id IN ({placeholders})
+            ORDER BY wf.weight DESC, f.created_at DESC
+        """
+        
+        rows = conn.execute(sql, workstream_ids).fetchall()
+        
+        # Limit per workstream
+        ws_counts: Dict[str, int] = {}
+        filtered = []
+        for row in rows:
+            ws_id = row["workstream_id"]
+            count = ws_counts.get(ws_id, 0)
+            if count < limit_per_ws:
+                filtered.append(row)
+                ws_counts[ws_id] = count + 1
+        
+        if not filtered:
+            return []
+        
+        # Hydrate
+        fact_ids = [row["fact_id"] for row in filtered]
+        evidence_map = get_evidence_for_fact_ids(fact_ids)
+        entities_map = get_entities_for_fact_ids(fact_ids)
+        
+        result = []
+        for row in filtered:
+            row_dict = {k: row[k] for k in row.keys()}
+            payload = row_dict.get("payload")
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+            
+            fid = row_dict["fact_id"]
+            fact = {
+                "fact_id": fid,
+                "org_id": row_dict["org_id"],
+                "meeting_id": row_dict.get("meeting_id"),
+                "transcript_id": row_dict.get("transcript_id"),
+                "fact_type": row_dict["fact_type"],
+                "status": row_dict["status"],
+                "confidence": row_dict.get("confidence"),
+                "payload": payload,
+                "due_iso": row_dict.get("due_iso"),
+                "due_at": row_dict.get("due_at"),
+                "created_at": row_dict.get("created_at"),
+                "updated_at": row_dict.get("updated_at"),
+                "workstream_id": row_dict.get("workstream_id"),
+                "weight": row_dict.get("weight", 1.0),
+                "evidence": [
+                    {k: e[k] for k in e.keys()}
+                    for e in evidence_map.get(fid, [])
+                ],
+                "entities": [
+                    {k: ent[k] for k in ent.keys() if k != "fact_id"}
+                    for ent in entities_map.get(fid, [])
+                ],
+            }
+            result.append(fact)
+        
+        return result
+
+
+def top_workstreams(org_id: str, limit: int = 3) -> List[Dict[str, Any]]:
+    """Get top workstreams by priority, status (non-green first), and recency."""
+    org_id = org_id or DEFAULT_ORG_ID
+    
+    with tx(readonly=True) as conn:
+        # Order: priority DESC, non-green status first, then newest
+        rows = conn.execute(
+            """
+            SELECT * FROM workstreams
+            WHERE org_id=?
+            ORDER BY
+                priority DESC,
+                CASE status
+                    WHEN 'red' THEN 0
+                    WHEN 'yellow' THEN 1
+                    WHEN 'green' THEN 2
+                    ELSE 3
+                END ASC,
+                updated_at DESC
+            LIMIT ?
+            """,
+            (org_id, limit),
+        ).fetchall()
+        
+        result = []
+        for row in rows:
+            ws = {k: row[k] for k in row.keys()}
+            if ws.get("tags"):
+                try:
+                    ws["tags"] = json.loads(ws["tags"])
+                except Exception:
+                    ws["tags"] = []
+            result.append(ws)
+        return result
+
+
+def get_workstream(workstream_id: str) -> Optional[Dict[str, Any]]:
+    """Get a single workstream by ID."""
+    with tx(readonly=True) as conn:
+        row = conn.execute(
+            "SELECT * FROM workstreams WHERE workstream_id=?",
+            (workstream_id,),
+        ).fetchone()
+        
+        if not row:
+            return None
+        
+        ws = {k: row[k] for k in row.keys()}
+        if ws.get("tags"):
+            try:
+                ws["tags"] = json.loads(ws["tags"])
+            except Exception:
+                ws["tags"] = []
+        return ws
+
+
+# ---------------------------------------------------------------------------
+# Meeting-Workstream Linking (many-to-many)
+# ---------------------------------------------------------------------------
+
+def link_meeting_to_workstream(meeting_id: str, workstream_id: str) -> bool:
+    """Link a meeting to a workstream. Returns True if linked."""
+    if not meeting_id or not workstream_id:
+        raise ValueError("meeting_id and workstream_id are required")
+    
+    # Verify workstream exists
+    ws = get_workstream(workstream_id)
+    if not ws:
+        raise ValueError(f"Workstream {workstream_id} not found")
+    
+    now = now_iso()
+    with tx() as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO meeting_workstreams(meeting_id, workstream_id, linked_at)
+                VALUES (?, ?, ?)
+                """,
+                (meeting_id, workstream_id, now),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            # Already linked
+            return False
+
+
+def unlink_meeting_from_workstream(meeting_id: str, workstream_id: str) -> bool:
+    """Unlink a meeting from a workstream. Returns True if unlinked."""
+    with tx() as conn:
+        cursor = conn.execute(
+            "DELETE FROM meeting_workstreams WHERE meeting_id=? AND workstream_id=?",
+            (meeting_id, workstream_id),
+        )
+        return cursor.rowcount > 0
+
+
+def get_meeting_workstreams(meeting_id: str) -> List[Dict[str, Any]]:
+    """Get all workstreams linked to a meeting."""
+    with tx(readonly=True) as conn:
+        rows = conn.execute(
+            """
+            SELECT w.* FROM workstreams w
+            JOIN meeting_workstreams mw ON w.workstream_id = mw.workstream_id
+            WHERE mw.meeting_id = ?
+            ORDER BY w.priority DESC, w.updated_at DESC
+            """,
+            (meeting_id,),
+        ).fetchall()
+        
+        result = []
+        for row in rows:
+            ws = {k: row[k] for k in row.keys()}
+            if ws.get("tags"):
+                try:
+                    ws["tags"] = json.loads(ws["tags"])
+                except Exception:
+                    ws["tags"] = []
+            result.append(ws)
+        return result
+
+
+def get_workstream_meetings(workstream_id: str, limit: int = 50) -> List[str]:
+    """Get all meeting IDs linked to a workstream."""
+    with tx(readonly=True) as conn:
+        rows = conn.execute(
+            """
+            SELECT meeting_id FROM meeting_workstreams
+            WHERE workstream_id = ?
+            ORDER BY linked_at DESC
+            LIMIT ?
+            """,
+            (workstream_id, limit),
+        ).fetchall()
+        
+        return [row["meeting_id"] for row in rows]
+
+
+def get_workstream_meeting_count(workstream_id: str) -> int:
+    """Get count of meetings linked to a workstream."""
+    with tx(readonly=True) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM meeting_workstreams WHERE workstream_id=?",
+            (workstream_id,),
+        ).fetchone()
+        return row["cnt"] if row else 0

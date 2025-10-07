@@ -24,6 +24,33 @@ FTS_ENABLED: bool = _env_flag("SPINE_FTS_ENABLED", True)
 DEFAULT_ORG_ID: str = os.getenv("DEFAULT_ORG_ID", "org_demo")
 
 # ---------------------------------------------------------------------------
+# Macro planning configuration (workstreams layer)
+# ---------------------------------------------------------------------------
+USE_MACRO_PLAN: bool = _env_flag("USE_MACRO_PLAN", True)
+MACRO_DEFAULT_MODE: str = os.getenv("MACRO_DEFAULT_MODE", "auto")  # auto|strict|off
+
+# ---------------------------------------------------------------------------
+# Planner v3 configuration (goal-oriented, intent-driven planning)
+# ---------------------------------------------------------------------------
+USE_PLANNER_V3: bool = _env_flag("USE_PLANNER_V3", True)  # Enable new planner by default
+PLANNER_V3_ORGS: Optional[str] = os.getenv("PLANNER_V3_ORGS")  # Comma-separated list for gradual rollout
+
+# ---------------------------------------------------------------------------
+# Automatic workstream creation
+# ---------------------------------------------------------------------------
+USE_AUTO_WORKSTREAMS: bool = _env_flag("USE_AUTO_WORKSTREAMS", False)  # Disabled by default (opt-in)
+AUTO_WS_MIN_CLUSTER_SIZE: int = int(os.getenv("AUTO_WS_MIN_CLUSTER_SIZE", "3"))  # Min facts per workstream
+AUTO_WS_MAX_PER_ORG: int = int(os.getenv("AUTO_WS_MAX_PER_ORG", "10"))  # Max auto-created workstreams
+AUTO_WS_STALE_DAYS: int = int(os.getenv("AUTO_WS_STALE_DAYS", "90"))  # Days before archiving inactive workstreams
+
+# ---------------------------------------------------------------------------
+# LangGraph-based agenda planning (v2.0)
+# ---------------------------------------------------------------------------
+USE_LANGGRAPH_AGENDA: bool = _env_flag("USE_LANGGRAPH_AGENDA", True)  # Enabled by default - v2.0 is production-ready
+LANGGRAPH_ORGS: Optional[str] = os.getenv("LANGGRAPH_ORGS")  # Comma-separated list for whitelisting (None = all orgs)
+LANGGRAPH_FALLBACK_LEGACY: bool = _env_flag("LANGGRAPH_FALLBACK_LEGACY", True)  # Fallback to legacy on errors
+
+# ---------------------------------------------------------------------------
 # Backwards compatibility helpers (legacy callers still import these)
 # ---------------------------------------------------------------------------
 

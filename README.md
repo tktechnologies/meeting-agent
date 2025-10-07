@@ -1,6 +1,21 @@
-﻿# Meeting Agenda Agent v0.2
+﻿# Meeting Agenda Agent v2.0
+
+🚀 **Now with LangGraph-powered iterative planning!**
 
 Local agenda planning on top of the Spine SQLite store. The agent retrieves recent org facts, proposes meeting agendas, and persists proposals as `facts` rows so reviewers can update the status lifecycle (`draft → proposed → validated → published → rejected`).
+
+## ✨ What's New in v2.0
+
+- **LangGraph Workflow**: 8-step iterative planning with quality review and auto-refinement
+- **LLM-Powered Intent Detection**: Automatically classifies meeting type (decision_making, problem_solving, planning, alignment, status_update, kickoff)
+- **Multi-Strategy Retrieval**: Combines workstreams, semantic search, and urgent facts with LLM ranking
+- **Quality Gates**: Self-reviews agendas and refines up to 2 times if quality score < 0.7
+- **Full Observability**: Metadata includes step timings, quality scores, retrieval stats, and refinement counts
+
+📖 **Documentation:**
+- **[Setup Guide](LANGGRAPH_SETUP.md)** - Quick start with LangGraph v2.0
+- **[Architecture](ARCHITECTURE.md)** - Code structure and migration plan
+- **Legacy planner** still available in `agent/legacy/` for fallback
 
 ## Highlights
 - SQLite Spine schema (facts, evidence, entities, transcripts) with optional FTS5.
@@ -12,7 +27,48 @@ Local agenda planning on top of the Spine SQLite store. The agent retrieves rece
 ## Requirements
 - Python 3.11+
 - No external services needed; SQLite is bundled.
-- Optional: FastAPI + Uvicorn for the HTTP API (install via `pip install fastapi uvicorn`).
+- **OpenAI API key** (GPT-5, GPT-4o, or compatible models) - shared with parsing-agent
+- Optional: FastAPI + Uvicorn for the HTTP API (install via `pip install -r requirements.txt`).
+
+## Quick Start
+
+### Traditional (Legacy Planner)
+```bash
+python -m agent.cli init-db --org org_demo
+python -m agent.cli seed minimal
+python -m agent.cli agenda propose --org org_demo --subject "Quarterly sync"
+python -m agent.cli agenda list --org org_demo
+```
+
+### LangGraph v2.0 (Recommended)
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Set environment variables (uses your existing OpenAI setup)
+export OPENAI_API_KEY="sk-..."  # Already configured for parsing-agent
+export USE_LANGGRAPH_AGENDA="true"  # Enable v2.0 planner
+
+# Start HTTP API
+python -m uvicorn agent.api:app --host 127.0.0.1 --port 8000
+
+# Test via API
+curl -X POST http://localhost:8000/agenda/plan-nl \
+  -H "Content-Type: application/json" \
+  -d '{"text": "próxima reunião com a BYD sobre integração", "org": "org_demo"}'
+```
+
+**Check response metadata to confirm v2.0:**
+```json
+{
+  "metadata": {
+    "version": "2.0",
+    "generator": "langgraph",
+    "quality_score": 0.85,
+    "intent": "decision_making"
+  }
+}
+```
 
 ## Running locally
 ```bash

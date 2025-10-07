@@ -4,7 +4,8 @@ from typing import Any, Dict, List, Optional, Sequence
 import json
 import re
 
-from . import db, planner
+from . import db
+from .legacy import planner
 
 
 def _parse_payload(raw: Any) -> Dict[str, Any]:
