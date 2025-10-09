@@ -51,7 +51,7 @@ if [ -z "$DB_PASSWORD" ]; then
     echo
 fi
 
-DATABASE_URL="postgresql://adminuser:${DB_PASSWORD}@postgres-db:5432/spine_db"
+DATABASE_URL="postgresql://adminuser:${DB_PASSWORD}@db-spine:5432/spine_db"
 
 log_info "Deploying $APP_NAME using 'az containerapp up'..."
 
