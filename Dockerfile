@@ -3,14 +3,17 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    SPINE_DB_PATH=/app/meeting-agent/spine_dev.sqlite3 \
+    SPINE_DB_PATH=/app/spine_dev.sqlite3 \
     DEFAULT_ORG_ID=org_demo
 
 WORKDIR /app
-COPY . /app
 
-# Install base deps (none declared explicitly) plus FastAPI stack
-RUN pip install --no-cache-dir fastapi uvicorn
+# Copy requirements and install dependencies
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the entire meeting-agent code
+COPY . ./
 
 EXPOSE 8000
 
