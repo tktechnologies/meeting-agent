@@ -225,6 +225,7 @@ if HAVE_FASTAPI:
                     "retrieval_stats": final_state.get("retrieval_stats"),
                     "errors": final_state.get("errors", []),
                     "session_id": session_id,  # Include session_id for progress tracking
+                    "ranked_facts": final_state.get("ranked_facts", []),  # ✅ Include ranked_facts for ref resolution
                 },
                 "subject": final_state.get("subject") or raw_query,
                 "org_id": org_id,
@@ -293,47 +294,82 @@ if HAVE_FASTAPI:
             fmt = (req.format or "json").lower()
             justify = bool(req.justify)
             
+            logger.info(f"🔍 Format: {fmt}, Justify: {justify}, will enter branch: {fmt == 'json' and justify}")
+            
             if fmt == "json" and justify:
-                # Process references (same logic as before)
-                prop = result.get("proposal") or {}
-                agenda = prop.get("agenda") or {}
-                
-                fact_ids_to_resolve = set()
-                for sec in agenda.get("sections", []):
-                    for item in sec.get("items", []):
-                        for bullet in item.get("bullets", []):
-                            refs = bullet.get("refs", [])
-                            for ref in refs:
-                                if isinstance(ref, str):
-                                    fact_ids_to_resolve.add(ref)
-                
-                fact_objects = {}
-                if fact_ids_to_resolve:
-                    rows = db.get_facts_by_ids(list(fact_ids_to_resolve))
-                    for row in rows:
-                        fact_objects[row["fact_id"]] = _row_to_fact(row)
-                
-                for sec in agenda.get("sections", []):
-                    for item in sec.get("items", []):
-                        for bullet in item.get("bullets", []):
-                            resolved_refs = []
-                            for ref in bullet.get("refs", []):
-                                if isinstance(ref, str) and ref in fact_objects:
-                                    resolved_refs.append(fact_objects[ref])
-                                elif isinstance(ref, dict):
-                                    resolved_refs.append(ref)
-                            bullet["refs"] = resolved_refs
-                
-                payload = textgen.agenda_to_json(
-                    {"agenda": agenda, "subject": result.get("subject")},
-                    language=lang,
-                    with_refs=True
-                )
-                payload["metadata"] = result.get("metadata", {})
-                
-                # Store final result in session
-                set_final_result(session_id, payload)
-                logger.info(f"✅ Background workflow completed for session {session_id}")
+                logger.info(f"📋 Processing JSON with refs (justify=True)")
+                try:
+                    # Process references (same logic as before)
+                    prop = result.get("proposal") or {}
+                    agenda = prop.get("agenda") or {}
+                    
+                    logger.info(f"📊 Agenda has {len(agenda.get('sections', []))} sections")
+                    
+                    # DEBUG: Log ranked_facts count from result metadata
+                    metadata = result.get("metadata", {})
+                    ranked_facts = metadata.get("ranked_facts", [])
+                    logger.info(f"📚 Metadata has {len(ranked_facts)} ranked_facts")
+                    
+                    fact_ids_to_resolve = set()
+                    for sec in agenda.get("sections", []):
+                        for item in sec.get("items", []):
+                            for bullet in item.get("bullets", []):
+                                refs = bullet.get("refs", [])
+                                for ref in refs:
+                                    if isinstance(ref, str):
+                                        fact_ids_to_resolve.add(ref)
+                    
+                    logger.info(f"📝 Found {len(fact_ids_to_resolve)} fact IDs to resolve")
+                    if len(fact_ids_to_resolve) > 0:
+                        logger.info(f"📋 Sample fact IDs: {list(fact_ids_to_resolve)[:5]}")
+                    
+                    fact_objects = {}
+                    if fact_ids_to_resolve:
+                        rows = db.get_facts_by_ids(list(fact_ids_to_resolve), org_id=org_id)
+                        logger.info(f"📥 Retrieved {len(rows)} fact objects from DB")
+                        for row in rows:
+                            fact_objects[row["fact_id"]] = _row_to_fact(row)
+                    
+                    for sec in agenda.get("sections", []):
+                        for item in sec.get("items", []):
+                            for bullet in item.get("bullets", []):
+                                resolved_refs = []
+                                for ref in bullet.get("refs", []):
+                                    if isinstance(ref, str) and ref in fact_objects:
+                                        resolved_refs.append(fact_objects[ref])
+                                    elif isinstance(ref, dict):
+                                        resolved_refs.append(ref)
+                                bullet["refs"] = resolved_refs
+                    
+                    logger.info(f"📤 Calling agenda_to_json with with_refs=True")
+                    payload = textgen.agenda_to_json(
+                        {"agenda": agenda, "subject": result.get("subject")},
+                        language=lang,
+                        with_refs=True
+                    )
+                    payload["metadata"] = result.get("metadata", {})
+                    
+                    logger.info(f"💾 About to call set_final_result for session {session_id}")
+                    # Store final result in session
+                    set_final_result(session_id, payload)
+                    logger.info(f"✅ Background workflow completed for session {session_id}")
+                    
+                except Exception as ref_error:
+                    logger.exception(f"❌ Error processing refs for session {session_id}: {ref_error}")
+                    # Try to save without refs as fallback
+                    try:
+                        prop = result.get("proposal") or {}
+                        payload = textgen.agenda_to_json(
+                            {"agenda": prop.get("agenda"), "subject": result.get("subject")},
+                            language=lang,
+                            with_refs=False
+                        )
+                        payload["metadata"] = result.get("metadata", {})
+                        set_final_result(session_id, payload)
+                        logger.info(f"✅ Saved result WITHOUT refs due to error")
+                    except Exception as fallback_error:
+                        logger.exception(f"❌ Even fallback failed: {fallback_error}")
+                        raise
                 
             elif fmt == "json":
                 prop = result.get("proposal") or {}
@@ -598,19 +634,24 @@ if HAVE_FASTAPI:
                     # Send current progress update
                     yield f"event: progress\ndata: {json.dumps(progress)}\n\n"
                     
-                    # If completed, send final result and close
-                    if progress.get("completed"):
-                        final_result = progress.get("final_result")
-                        if final_result:
-                            completion_event = {
-                                "completed": True,
-                                "result": final_result
-                            }
-                            yield f"event: complete\ndata: {json.dumps(completion_event)}\n\n"
+                    # If completed AND has final_result, send completion event
+                    if progress.get("completed") and progress.get("final_result"):
+                        final_result = progress["final_result"]
+                        
+                        completion_event = {
+                            "completed": True,
+                            "result": final_result
+                        }
+                        yield f"event: complete\ndata: {json.dumps(completion_event)}\n\n"
+                        logger.info(f"✅ Sent complete event with result for session {session_id}")
                         
                         await asyncio.sleep(0.5)  # Give client time to receive
                         cleanup_session(session_id)
                         break
+                    
+                    # Don't cleanup on errors - workflow might still complete with fallbacks
+                    # Just send error info in progress updates
+                    # The session will be cleaned up when completed=True + final_result exists
                     
                     # Poll every 500ms
                     await asyncio.sleep(0.5)

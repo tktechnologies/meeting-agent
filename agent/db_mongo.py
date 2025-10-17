@@ -8,9 +8,12 @@ All functions match the signatures from db.py to ensure drop-in compatibility.
 """
 import os
 import json
+import logging
 from typing import List, Dict, Any, Optional, Sequence
 from datetime import datetime
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class Row(dict):
@@ -186,20 +189,34 @@ class MongoDBAdapter:
         """Get recent facts sorted by created_at DESC"""
         return self.search_facts(org_id, query=None, types=types, limit=limit)
     
-    def get_facts_by_ids(self, fact_ids: List[str]) -> List[Row]:
+    def get_facts_by_ids(self, fact_ids: List[str], org_id: str = 'org_demo') -> List[Row]:
         """Get multiple facts by their IDs"""
         if not fact_ids:
             return []
         
+        # Make individual requests for each fact_id
+        # (API doesn't support batch lookup yet, but search now matches fact_id exactly)
         facts = []
         for fact_id in fact_ids:
             try:
-                all_facts = self.search_facts('org_demo', query=fact_id, limit=1000)
-                for f in all_facts:
-                    if f['fact_id'] == fact_id:
-                        facts.append(f)
-                        break
-            except Exception:
+                # search_facts now matches fact_id exactly (after chat-agent fix)
+                result_rows = self.search_facts(org_id, query=fact_id, limit=1)
+                logger.info(f"🔍 Searching for fact_id={fact_id}, got {len(result_rows)} results")
+                if result_rows:
+                    # Verify it's the exact fact we're looking for
+                    # Row is a dict, so access directly
+                    fact_dict = result_rows[0]
+                    actual_id = fact_dict.get('fact_id')
+                    logger.info(f"📋 Search returned fact_id={actual_id}, expected={fact_id}")
+                    if actual_id == fact_id:
+                        facts.append(result_rows[0])
+                        logger.info(f"✅ Found fact {fact_id}")
+                    else:
+                        logger.warning(f"⚠️ Search for {fact_id} returned {actual_id}, skipping")
+                else:
+                    logger.warning(f"⚠️ No results for fact_id={fact_id}")
+            except Exception as e:
+                logger.exception(f"❌ Failed to retrieve fact {fact_id}: {e}")
                 continue
         
         return facts

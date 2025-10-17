@@ -27,7 +27,8 @@ class MultiStrategyRetriever:
     
     def __init__(self, org_id: str):
         self.org_id = org_id
-        self.conn = db.get_conn()
+        # Only get connection if using SQLite (MongoDB doesn't need it)
+        self.conn = db.get_conn() if hasattr(db, 'get_conn') else None
     
     def get_workstream_facts(
         self,
@@ -47,6 +48,21 @@ class MultiStrategyRetriever:
         if not workstream_ids:
             return []
         
+        # Use MongoDB API if available
+        if self.conn is None:
+            # Use db_router's get_facts_by_workstreams method
+            try:
+                facts = db.get_facts_by_workstreams(
+                    self.org_id, 
+                    workstream_ids, 
+                    limit=limit_per_ws * len(workstream_ids)
+                )
+                return facts
+            except Exception as e:
+                print(f"⚠️ Error getting workstream facts: {e}")
+                return []
+        
+        # SQLite path
         facts = []
         cursor = self.conn.cursor()
         
@@ -99,6 +115,16 @@ class MultiStrategyRetriever:
         Returns:
             List of fact dicts
         """
+        # Use MongoDB API if available
+        if self.conn is None:
+            try:
+                facts = db.search_facts(self.org_id, query, limit=limit)
+                return facts
+            except Exception as e:
+                print(f"⚠️ Error searching facts: {e}")
+                return []
+        
+        # SQLite path
         cursor = self.conn.cursor()
         
         # Use FTS if available, otherwise LIKE search
@@ -177,6 +203,40 @@ class MultiStrategyRetriever:
         Returns:
             List of fact dicts
         """
+        # Use MongoDB API if available
+        if self.conn is None:
+            try:
+                # Get recent facts and filter by priority
+                facts = db.get_recent_facts(self.org_id, limit=limit * 3)
+                
+                now_iso = datetime.utcnow().isoformat() + "Z"
+                week_ago = (datetime.utcnow() - timedelta(days=7)).isoformat() + "Z"
+                
+                # Filter for urgent facts
+                urgent = []
+                for f in facts:
+                    is_urgent = False
+                    # Check if overdue
+                    if f.get("due_iso") and f["due_iso"] < now_iso:
+                        is_urgent = True
+                    # Check if high-priority type
+                    if f.get("fact_type") in ('blocker', 'decision_needed', 'risk', 'decision'):
+                        is_urgent = True
+                    # Check if recent action item
+                    if f.get("fact_type") == 'action_item' and f.get("created_at", "") > week_ago:
+                        is_urgent = True
+                    
+                    if is_urgent:
+                        urgent.append(f)
+                        if len(urgent) >= limit:
+                            break
+                
+                return urgent
+            except Exception as e:
+                print(f"⚠️ Error getting urgent facts: {e}")
+                return []
+        
+        # SQLite path
         cursor = self.conn.cursor()
         
         now_iso = datetime.utcnow().isoformat() + "Z"

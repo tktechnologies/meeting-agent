@@ -79,9 +79,9 @@ def update_progress(session_id: str, step: str, status: str = "running", error: 
             if step not in session["completed_steps"]:
                 session["completed_steps"].append(step)
             
-            # Check if all steps are done
+            # Check if all steps are done, but DON'T set completed=True yet
+            # That will be set by set_final_result() to avoid race condition
             if len(session["completed_steps"]) >= session["total_steps"]:
-                session["completed"] = True
                 session["current_step"] = None
                 session["current_message"] = "Concluído!" if language == "pt-BR" else "Completed!"
         
@@ -110,7 +110,14 @@ def get_all_sessions() -> Dict[str, Dict[str, Any]]:
 
 def set_final_result(session_id: str, result: Dict[str, Any]):
     """Store the final workflow result in the session."""
+    import logging
+    logger = logging.getLogger(__name__)
+    
     with _progress_lock:
         if session_id in _progress_sessions:
+            logger.info(f"💾 set_final_result: Storing result for session {session_id}")
             _progress_sessions[session_id]["final_result"] = result
             _progress_sessions[session_id]["completed"] = True
+            logger.info(f"✅ set_final_result: Result stored successfully for session {session_id}")
+        else:
+            logger.error(f"❌ set_final_result: Session {session_id} NOT FOUND in _progress_sessions! It may have been cleaned up already.")

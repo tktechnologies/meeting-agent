@@ -478,6 +478,7 @@ def retrieve_facts(state: AgendaState) -> AgendaState:
         logger.info(f"📊 Retrieved {len(all_facts)} facts | Stats: {stats}")
         if all_facts:
             logger.info(f"📝 Sample facts: {[f.get('content', '')[:50] for f in all_facts[:3]]}")
+            logger.info(f"📋 Sample fact IDs: {[f.get('fact_id') for f in all_facts[:5]]}")
         else:
             logger.warning("⚠️  No internal facts found - will try web search for external context")
         
@@ -665,7 +666,16 @@ def generate_macro_summary(state: AgendaState) -> AgendaState:
         
         response = llm.invoke([HumanMessage(content=prompt)])
         
-        state["macro_summary"] = response.content.strip()
+        # Handle both string and list responses (GPT-5 can return list)
+        content = response.content
+        if isinstance(content, list):
+            # Extract text from list of content blocks
+            content = " ".join(
+                block.get("text", str(block)) if isinstance(block, dict) else str(block)
+                for block in content
+            )
+        
+        state["macro_summary"] = content.strip()
         
     except Exception as e:
         _update_progress(state, "generate_macro_summary", "error", str(e))
@@ -719,6 +729,12 @@ def build_agenda(state: AgendaState) -> AgendaState:
             state.get("web_search_context")  # Pass web search results
         )
         
+        # DEBUG: Log facts being sent to LLM
+        ranked_facts = state.get("ranked_facts", [])
+        if ranked_facts:
+            fact_ids = [f.get("fact_id") for f in ranked_facts[:5]]
+            logger.info(f"📋 [build_agenda] Sending {len(ranked_facts)} facts to LLM, sample IDs: {fact_ids}")
+        
         logger.info(f"🤖 Calling LLM to build agenda (model: {llm.model_name if hasattr(llm, 'model_name') else 'unknown'})...")
         response = llm.invoke([HumanMessage(content=prompt)])
         draft_agenda = _parse_llm_response(response)
@@ -726,6 +742,33 @@ def build_agenda(state: AgendaState) -> AgendaState:
         sections_count = len(draft_agenda.get("sections", []))
         logger.info(f"✨ LLM returned agenda with {sections_count} sections")
         logger.info(f"📋 Section titles: {[s.get('title') for s in draft_agenda.get('sections', [])]}")
+        
+        # DEBUG: Check if LLM included refs in bullets
+        total_bullets = 0
+        bullets_with_refs = 0
+        total_refs = 0
+        for section in draft_agenda.get("sections", []):
+            for item in section.get("items", []):
+                for bullet in item.get("bullets", []):
+                    total_bullets += 1
+                    refs = bullet.get("refs", [])
+                    if refs:
+                        bullets_with_refs += 1
+                        total_refs += len(refs)
+        
+        logger.info(f"🔍 [build_agenda] Bullets: {total_bullets}, With refs: {bullets_with_refs}, Total refs: {total_refs}")
+        if total_refs > 0:
+            # Log sample refs
+            sample_refs = []
+            for section in draft_agenda.get("sections", [])[:2]:  # First 2 sections
+                for item in section.get("items", [])[:2]:  # First 2 items
+                    for bullet in item.get("bullets", [])[:2]:  # First 2 bullets
+                        refs = bullet.get("refs", [])
+                        if refs:
+                            sample_refs.append(refs)
+                            if len(sample_refs) >= 3:
+                                break
+            logger.info(f"📎 [build_agenda] Sample refs: {sample_refs[:3]}")
         
         state["draft_agenda"] = draft_agenda
         _log_node_complete("build_agenda", f"{sections_count} sections created")
@@ -853,6 +896,21 @@ def finalize_agenda(state: AgendaState) -> AgendaState:
         sections_count = len(final_agenda.get("sections", []))
         logger.info(f"📋 Finalizing agenda with {sections_count} sections")
         logger.info(f"📋 Section titles: {[s.get('title') for s in final_agenda.get('sections', [])]}")
+        
+        # DEBUG: Check if refs survived to finalization
+        total_bullets = 0
+        bullets_with_refs = 0
+        total_refs = 0
+        for section in final_agenda.get("sections", []):
+            for item in section.get("items", []):
+                for bullet in item.get("bullets", []):
+                    total_bullets += 1
+                    refs = bullet.get("refs", [])
+                    if refs:
+                        bullets_with_refs += 1
+                        total_refs += len(refs)
+        
+        logger.info(f"🔍 [finalize_agenda] Bullets: {total_bullets}, With refs: {bullets_with_refs}, Total refs: {total_refs}")
         
         # Add metadata v2.0
         final_agenda["_metadata"] = {
