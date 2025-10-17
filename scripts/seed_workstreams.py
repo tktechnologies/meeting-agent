@@ -14,7 +14,7 @@ from pathlib import Path
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent import db
+from agent import db_router as db
 
 
 def seed_byd_workstreams():

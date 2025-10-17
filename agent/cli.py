@@ -5,7 +5,7 @@ import json
 import sys
 from typing import Any, Dict, List, Optional
 
-from . import agenda, db, retrieval, textgen
+from . import agenda, db_router as db, retrieval, textgen
 from .config import DB_PATH, DEFAULT_ORG_ID
 from .nl_parser import parse_nl
 

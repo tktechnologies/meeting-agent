@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import re
 
 from .config import DEFAULT_ORG_ID
-from . import db
+from . import db_router as db
 from . import auto_validate
 
 

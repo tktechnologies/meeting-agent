@@ -3,7 +3,7 @@ import json
 from typing import Any, Dict, List, Optional, Sequence
 import re
 
-from .. import db
+from .. import db_router as db
 from .. import retrieval
 from ..config import DEFAULT_ORG_ID
 

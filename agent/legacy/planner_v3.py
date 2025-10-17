@@ -7,7 +7,7 @@ and actionable facts, not retrospective summaries.
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
 
-from .. import db
+from .. import db_router as db
 from . import text_quality
 from ..config import DEFAULT_ORG_ID
 

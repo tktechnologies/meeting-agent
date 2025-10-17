@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import config
-from . import db
+from . import db_router as db
 
 logger = logging.getLogger(__name__)
 

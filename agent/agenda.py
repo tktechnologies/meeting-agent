@@ -5,7 +5,7 @@ from . import retrieval
 from .legacy import planner
 from .legacy import planner_v3
 from .legacy import intent as intent_module
-from . import db
+from . import db_router as db
 from .config import DEFAULT_ORG_ID, MACRO_DEFAULT_MODE, USE_MACRO_PLAN, USE_PLANNER_V3, PLANNER_V3_ORGS
 from .nl_parser import parse_nl
 

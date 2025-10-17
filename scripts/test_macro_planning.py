@@ -15,7 +15,7 @@ import json
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent import db, retrieval, planner, agenda
+from agent import db_router as db, retrieval, planner, agenda
 
 
 def test_macro_planning():

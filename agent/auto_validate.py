@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import json
 import re
 
-from . import db
+from . import db_router as db
 from .legacy import planner
 
 

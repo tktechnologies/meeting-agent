@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from agent import agenda, textgen, nl_parser, retrieval, db
+from agent import agenda, textgen, nl_parser, retrieval, db_router as db
 
 
 def main() -> None:

@@ -12,7 +12,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 import json
 
-from .. import db
+from .. import db_router as db
 
 
 def _row_to_dict(row) -> Dict[str, Any]:

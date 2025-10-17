@@ -24,7 +24,7 @@ try:
 except Exception:  # pragma: no cover - FastAPI optional in local envs
     HAVE_FASTAPI = False
 
-from . import agenda, db, retrieval, textgen, nl_parser, workstream_auto
+from . import agenda, db_router as db, retrieval, textgen, nl_parser, workstream_auto
 from . import config
 import logging
 import time

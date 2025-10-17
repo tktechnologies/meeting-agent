@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Iterable, Optional
 
-from agent import db
+from agent import db_router as db
 from agent.config import DB_PATH
 from .ingest_bundle import ingest_bundle
 

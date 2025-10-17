@@ -2,6 +2,15 @@
 from pathlib import Path
 from typing import Optional
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parents[1] / '.env'
+    if _env_path.exists():
+        load_dotenv(_env_path)
+except ImportError:
+    pass  # dotenv not installed, rely on system environment
+
 _DEF_DB_FILENAME = "spine_dev.sqlite3"
 
 def _resolve_default_db_path() -> str:
@@ -22,6 +31,13 @@ def _env_flag(name: str, default: bool) -> bool:
 
 FTS_ENABLED: bool = _env_flag("SPINE_FTS_ENABLED", True)
 DEFAULT_ORG_ID: str = os.getenv("DEFAULT_ORG_ID", "org_demo")
+
+# ---------------------------------------------------------------------------
+# MongoDB storage configuration
+# ---------------------------------------------------------------------------
+USE_MONGODB_STORAGE: bool = _env_flag("USE_MONGODB_STORAGE", False)
+CHAT_AGENT_URL: str = os.getenv("CHAT_AGENT_URL", "http://localhost:5000")
+SERVICE_TOKEN: Optional[str] = os.getenv("SERVICE_TOKEN")
 
 # ---------------------------------------------------------------------------
 # Macro planning configuration (workstreams layer)

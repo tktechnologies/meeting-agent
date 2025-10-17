@@ -44,7 +44,7 @@ from .prompts import (
 )
 from ..retrievers.multi_strategy import MultiStrategyRetriever
 from ..intent.templates import get_section_template
-from .. import db
+from .. import db_router as db
 from .progress import update_progress
 
 # Import web search tool
@@ -223,29 +223,37 @@ def analyze_context(state: AgendaState) -> AgendaState:
     try:
         org_id = state.get("org_id", "org_demo")
         
-        # Fetch recent meetings from DB
-        conn = db.get_conn()
-        cursor = conn.cursor()
-        
-        recent_query = """
-            SELECT meeting_id, created_at, participants, agenda
-            FROM meetings
-            WHERE org_id = ?
-            ORDER BY created_at DESC
-            LIMIT 5
-        """
-        
-        rows = cursor.execute(recent_query, (org_id,)).fetchall()
+        # Fetch recent meetings from DB (SQLite only - not supported in MongoDB yet)
         recent_meetings = []
-        
-        for row in rows:
-            meeting = {
-                "meeting_id": row[0],
-                "created_at": row[1],
-                "participants": json.loads(row[2]) if row[2] else [],
-                "agenda": json.loads(row[3]) if row[3] else {},
-            }
-            recent_meetings.append(meeting)
+        try:
+            # Check if we have get_conn (SQLite mode)
+            if hasattr(db, 'get_conn'):
+                conn = db.get_conn()
+                cursor = conn.cursor()
+                
+                recent_query = """
+                    SELECT meeting_id, created_at, participants, agenda
+                    FROM meetings
+                    WHERE org_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT 5
+                """
+                
+                rows = cursor.execute(recent_query, (org_id,)).fetchall()
+                
+                for row in rows:
+                    meeting = {
+                        "meeting_id": row[0],
+                        "created_at": row[1],
+                        "participants": json.loads(row[2]) if row[2] else [],
+                        "agenda": json.loads(row[3]) if row[3] else {},
+                    }
+                    recent_meetings.append(meeting)
+            else:
+                logger.info("📝 MongoDB mode: Recent meetings analysis skipped (not yet supported)")
+        except Exception as db_err:
+            logger.warning(f"⚠️  Could not fetch recent meetings: {db_err}")
+            recent_meetings = []
         
         # Extract open items from agendas
         open_items = []
@@ -334,25 +342,17 @@ def detect_intent(state: AgendaState) -> AgendaState:
         # STEP 1: Fetch ALL workstreams from DB first
         available_workstreams = []
         try:
-            conn = db.get_conn()
-            cursor = conn.cursor()
+            # Use db_router abstraction for MongoDB/SQLite compatibility
+            workstream_rows = db.list_workstreams(org_id=org_id)
             
-            ws_query = """
-                SELECT workstream_id, title, description, status, priority, owner
-                FROM workstreams
-                WHERE org_id = ?
-                ORDER BY priority DESC, title ASC
-            """
-            
-            rows = cursor.execute(ws_query, (org_id,)).fetchall()
-            for row in rows:
+            for ws in workstream_rows:
                 available_workstreams.append({
-                    "workstream_id": row[0],
-                    "title": row[1],
-                    "description": row[2] or "",
-                    "status": row[3] or "green",
-                    "priority": row[4] or 1,
-                    "owner": row[5],
+                    "workstream_id": ws.get("workstream_id") or ws.get("id"),
+                    "title": ws.get("title", ""),
+                    "description": ws.get("description", ""),
+                    "status": ws.get("status", "green"),
+                    "priority": ws.get("priority", 1),
+                    "owner": ws.get("owner", ""),
                 })
             
             logger.info(f"📚 Found {len(available_workstreams)} workstreams in DB for org={org_id}")

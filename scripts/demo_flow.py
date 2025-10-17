@@ -3,7 +3,7 @@
 import json
 from pprint import pprint
 
-from agent import agenda, db
+from agent import agenda, db_router as db
 from agent.config import DEFAULT_ORG_ID
 from .seed import run as seed_run
 

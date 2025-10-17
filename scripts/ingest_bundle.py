@@ -13,7 +13,7 @@ MEETING_AGENT_ROOT = Path(__file__).resolve().parents[1]
 if str(MEETING_AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(MEETING_AGENT_ROOT))
 
-from agent import db
+from agent import db_router as db
 from agent.config import DEFAULT_ORG_ID
 
 

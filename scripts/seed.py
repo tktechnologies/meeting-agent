@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
-from agent import db
+from agent import db_router as db
 from agent.config import DEFAULT_ORG_ID
 
 
