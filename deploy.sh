@@ -46,10 +46,6 @@ if [ -z "$TAVILY_API_KEY" ]; then
     read -p "Enter Tavily API Key: " TAVILY_API_KEY
 fi
 
-if [ -z "$SERVICE_TOKEN" ]; then
-    read -p "Enter Service Token (shared across agents): " SERVICE_TOKEN
-fi
-
 # Get chat-agent URL (required for MongoDB storage)
 if [ -z "$CHAT_AGENT_URL" ]; then
     CHAT_AGENT_URL=$(az containerapp show --name chat-agent --resource-group "$RESOURCE_GROUP" --query "properties.configuration.ingress.fqdn" -o tsv 2>/dev/null || echo "")
@@ -76,7 +72,6 @@ az containerapp up \
         "TAVILY_API_KEY=$TAVILY_API_KEY" \
         "USE_MONGODB_STORAGE=true" \
         "CHAT_AGENT_URL=$CHAT_AGENT_URL" \
-        "SERVICE_TOKEN=$SERVICE_TOKEN" \
         "USE_LANGGRAPH_AGENDA=true" \
         "DEFAULT_ORG_ID=org_demo"
 
