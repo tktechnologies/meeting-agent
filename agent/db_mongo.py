@@ -556,6 +556,15 @@ class MongoDBAdapter:
     # HELPER METHODS FOR COMPATIBILITY
     # =========================================================================
     
+    def init_db(self) -> None:
+        """
+        Compatibility method - MongoDB doesn't require database initialization.
+        The chat-agent backend handles schema management.
+        This is a no-op to maintain compatibility with CLI commands.
+        """
+        logger.info('[MongoDB] init_db called - no action required (MongoDB managed by chat-agent)')
+        pass
+    
     def now_iso(self) -> str:
         """Get current ISO timestamp"""
         return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")

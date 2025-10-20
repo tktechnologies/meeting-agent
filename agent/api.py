@@ -968,7 +968,9 @@ def main() -> None:
         return
     import uvicorn
 
-    uvicorn.run("agent.api:app", host="0.0.0.0", port=8000, reload=False)
+    # Allow port to be configured via PORT env var (for Azure Container Apps)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("agent.api:app", host="0.0.0.0", port=port, reload=False)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -18,6 +18,7 @@ if USE_MONGODB_STORAGE:
     _adapter = get_adapter()
     
     # Expose all methods from MongoDB adapter
+    init_db = _adapter.init_db  # No-op for MongoDB compatibility
     list_orgs = _adapter.list_orgs
     get_org = _adapter.get_org
     find_org_by_text = _adapter.find_org_by_text
@@ -125,6 +126,7 @@ else:
 
 # Export all functions
 __all__ = [
+    'init_db',
     'list_orgs',
     'get_org',
     'find_org_by_text',
