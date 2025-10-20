@@ -15,8 +15,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the entire meeting-agent code
 COPY . ./
 
+# Make startup script executable
+RUN chmod +x startup.sh
+
 EXPOSE 8000
 
-# Initialize DB (idempotent) then start API
-CMD python -m agent.cli init-db --org ${DEFAULT_ORG_ID} && \
-    python -m agent.api
+# Use smart startup script that handles both SQLite and MongoDB modes
+CMD ["./startup.sh"]
