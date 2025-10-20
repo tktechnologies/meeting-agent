@@ -48,9 +48,20 @@ if HAVE_FASTAPI:
     app = FastAPI(title="Meeting Agenda Agent", version="0.2")
     
     # Add CORS middleware to allow frontend access
+    # Get allowed origins from environment or use defaults for local development
+    allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
+    if allowed_origins_env:
+        # Split comma-separated origins from environment variable
+        allowed_origins = [origin.strip() for origin in allowed_origins_env.split(",")]
+        print(f"✅ CORS: Using origins from ALLOWED_ORIGINS env var: {allowed_origins}")
+    else:
+        # Default to localhost for local development
+        allowed_origins = ["http://localhost:5000", "http://127.0.0.1:5000"]
+        print(f"⚠️  CORS: Using default localhost origins (set ALLOWED_ORIGINS for production)")
+    
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5000", "http://127.0.0.1:5000"],
+        allow_origins=allowed_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
