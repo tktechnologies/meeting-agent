@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# Build and push meeting-agent Docker image to Azure Container Registry
+# Build and push meeting-agent Docker image to Azure Container Registry using ACR Build
+# This method works in Azure Cloud Shell without requiring Docker daemon
 # After running this, create a new revision in Azure Portal using this image
 
 set -e  # Exit on error
@@ -30,38 +31,40 @@ if [ ! -f "Dockerfile" ]; then
     exit 1
 fi
 
-log_info "Building and pushing $IMAGE_NAME:$TAG to $ACR_NAME.azurecr.io..."
+log_info "Building and pushing $IMAGE_NAME:$TAG to $ACR_NAME.azurecr.io using ACR Build..."
+log_info "This uses Azure's cloud build service - no local Docker daemon required!"
 
-# Login to ACR
-log_info "Logging in to Azure Container Registry..."
-az acr login --name "$ACR_NAME"
+# Use ACR build task to build and push in the cloud
+log_info "Starting ACR build task..."
+az acr build \
+    --registry "$ACR_NAME" \
+    --image "${IMAGE_NAME}:${TAG}" \
+    --file Dockerfile \
+    .
 
-# Build the Docker image
-log_info "Building Docker image..."
-docker build -t "${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${TAG}" .
-
-# Push to ACR
-log_info "Pushing image to ACR..."
-docker push "${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${TAG}"
-
-log_info "✅ Deployment complete!"
+log_info "✅ Build and push complete!"
 echo ""
-echo "Image pushed to: ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${TAG}"
+echo "Image available at: ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${TAG}"
 echo ""
 echo "Next steps:"
-echo "1. Go to Azure Portal"
-echo "2. Navigate to your Container App: meeting-agent"
-echo "3. Click 'Create new revision'"
-echo "4. Select image: ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${TAG}"
-echo "5. Configure environment variables if needed"
-echo "6. Create the revision"
+echo "1. Go to Azure Portal → Container Apps → meeting-agent"
+echo "2. Click 'Revision management' → 'Create new revision'"
+echo "3. Select container image:"
+echo "   Registry: ${ACR_NAME}.azurecr.io"
+echo "   Image: ${IMAGE_NAME}"
+echo "   Tag: ${TAG}"
+echo "4. Verify environment variables (see below)"
+echo "5. Click 'Create'"
 echo ""
-echo "Environment variables to set in Azure Portal:"
-echo "  - OPENAI_API_KEY"
-echo "  - TAVILY_API_KEY"
-echo "  - USE_MONGODB_STORAGE=true"
-echo "  - CHAT_AGENT_URL=https://stokai-dev.azurewebsites.net"
-echo "  - SERVICE_TOKEN=<your-service-token>"
-echo "  - DEFAULT_ORG_ID=<your-org-id>"
-echo "  - ALLOWED_ORIGINS=https://stokai-dev.azurewebsites.net,https://meeting-agent.yellowdesert-a5580b23.eastus2.azurecontainerapps.io"
-echo "  - PORT=8000"
+echo "Required environment variables:"
+echo "  ✓ OPENAI_API_KEY=sk-proj-..."
+echo "  ✓ TAVILY_API_KEY=tvly-dev-..."
+echo "  ✓ USE_MONGODB_STORAGE=true"
+echo "  ✓ CHAT_AGENT_URL=https://stokai-dev.azurewebsites.net"
+echo "  ✓ SERVICE_TOKEN=<your-service-token>"
+echo "  ✓ DEFAULT_ORG_ID=<your-org-id>"
+echo "  ✓ ALLOWED_ORIGINS=https://stokai-dev.azurewebsites.net,https://meeting-agent.yellowdesert-a5580b23.eastus2.azurecontainerapps.io"
+echo "  ✓ PORT=8000"
+echo ""
+echo "Verify deployment:"
+echo "  curl https://meeting-agent.yellowdesert-a5580b23.eastus2.azurecontainerapps.io/health"
