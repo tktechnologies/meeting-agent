@@ -46,12 +46,19 @@ if [ -z "$TAVILY_API_KEY" ]; then
     read -p "Enter Tavily API Key: " TAVILY_API_KEY
 fi
 
-if [ -z "$DB_PASSWORD" ]; then
-    read -sp "Enter PostgreSQL password: " DB_PASSWORD
-    echo
+if [ -z "$SERVICE_TOKEN" ]; then
+    read -p "Enter Service Token (shared across agents): " SERVICE_TOKEN
 fi
 
-DATABASE_URL="postgresql://adminuser:${DB_PASSWORD}@db-spine:5432/spine_db"
+# Get chat-agent URL (required for MongoDB storage)
+if [ -z "$CHAT_AGENT_URL" ]; then
+    CHAT_AGENT_URL=$(az containerapp show --name chat-agent --resource-group "$RESOURCE_GROUP" --query "properties.configuration.ingress.fqdn" -o tsv 2>/dev/null || echo "")
+    if [ -n "$CHAT_AGENT_URL" ]; then
+        CHAT_AGENT_URL="https://${CHAT_AGENT_URL}"
+    else
+        read -p "Enter Chat Agent URL (e.g., https://chat-agent.azurecontainerapps.io): " CHAT_AGENT_URL
+    fi
+fi
 
 log_info "Deploying $APP_NAME using 'az containerapp up'..."
 
@@ -67,7 +74,9 @@ az containerapp up \
     --env-vars \
         "OPENAI_API_KEY=$OPENAI_API_KEY" \
         "TAVILY_API_KEY=$TAVILY_API_KEY" \
-        "DATABASE_URL=$DATABASE_URL" \
+        "USE_MONGODB_STORAGE=true" \
+        "CHAT_AGENT_URL=$CHAT_AGENT_URL" \
+        "SERVICE_TOKEN=$SERVICE_TOKEN" \
         "USE_LANGGRAPH_AGENDA=true" \
         "DEFAULT_ORG_ID=org_demo"
 
