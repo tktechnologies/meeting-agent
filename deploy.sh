@@ -1,15 +1,14 @@
 #!/bin/bash
 
-# Deploy meeting-agent to Azure Container Apps
-# Run this from Azure Cloud Shell after cloning the repository
+# Build and push meeting-agent Docker image to Azure Container Registry
+# After running this, create a new revision in Azure Portal using this image
 
 set -e  # Exit on error
 
 # Configuration
-RESOURCE_GROUP="stokai-tk"
-ENVIRONMENT="stok-ai"
-APP_NAME="meeting-agent"
-LOCATION="eastus2"
+ACR_NAME="acrstokai"
+IMAGE_NAME="meeting-agent"
+TAG="${1:-latest}"  # Use first argument as tag, default to 'latest'
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -19,10 +18,6 @@ NC='\033[0m' # No Color
 
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
-}
-
-log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
 }
 
 log_error() {
@@ -35,56 +30,38 @@ if [ ! -f "Dockerfile" ]; then
     exit 1
 fi
 
-log_info "Starting deployment of $APP_NAME to Azure Container Apps..."
+log_info "Building and pushing $IMAGE_NAME:$TAG to $ACR_NAME.azurecr.io..."
 
-# Prompt for secrets if not set
-if [ -z "$OPENAI_API_KEY" ]; then
-    read -p "Enter OpenAI API Key: " OPENAI_API_KEY
-fi
+# Login to ACR
+log_info "Logging in to Azure Container Registry..."
+az acr login --name "$ACR_NAME"
 
-if [ -z "$TAVILY_API_KEY" ]; then
-    read -p "Enter Tavily API Key: " TAVILY_API_KEY
-fi
+# Build the Docker image
+log_info "Building Docker image..."
+docker build -t "${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${TAG}" .
 
-# Get chat-agent URL (required for MongoDB storage)
-if [ -z "$CHAT_AGENT_URL" ]; then
-    CHAT_AGENT_URL=$(az containerapp show --name chat-agent --resource-group "$RESOURCE_GROUP" --query "properties.configuration.ingress.fqdn" -o tsv 2>/dev/null || echo "")
-    if [ -n "$CHAT_AGENT_URL" ]; then
-        CHAT_AGENT_URL="https://${CHAT_AGENT_URL}"
-    else
-        read -p "Enter Chat Agent URL (e.g., https://chat-agent.azurecontainerapps.io): " CHAT_AGENT_URL
-    fi
-fi
+# Push to ACR
+log_info "Pushing image to ACR..."
+docker push "${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${TAG}"
 
-log_info "Deploying $APP_NAME using 'az containerapp up'..."
-
-# Deploy using az containerapp up (handles ACR creation, build, and deployment)
-az containerapp up \
-    --name "$APP_NAME" \
-    --resource-group "$RESOURCE_GROUP" \
-    --environment "$ENVIRONMENT" \
-    --location "$LOCATION" \
-    --source . \
-    --target-port 8000 \
-    --ingress external \
-    --env-vars \
-        "OPENAI_API_KEY=$OPENAI_API_KEY" \
-        "TAVILY_API_KEY=$TAVILY_API_KEY" \
-        "USE_MONGODB_STORAGE=true" \
-        "CHAT_AGENT_URL=$CHAT_AGENT_URL" \
-        "USE_LANGGRAPH_AGENDA=true" \
-        "DEFAULT_ORG_ID=org_demo"
-
-# Get the URL
-APP_URL=$(az containerapp show \
-    --name "$APP_NAME" \
-    --resource-group "$RESOURCE_GROUP" \
-    --query "properties.configuration.ingress.fqdn" -o tsv)
-
-log_info "Deployment complete!"
-log_info "App URL: https://$APP_URL"
-log_info "Health check: https://$APP_URL/health"
-
+log_info "✅ Deployment complete!"
 echo ""
-echo "Test the deployment with:"
-echo "  curl https://$APP_URL/health"
+echo "Image pushed to: ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${TAG}"
+echo ""
+echo "Next steps:"
+echo "1. Go to Azure Portal"
+echo "2. Navigate to your Container App: meeting-agent"
+echo "3. Click 'Create new revision'"
+echo "4. Select image: ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${TAG}"
+echo "5. Configure environment variables if needed"
+echo "6. Create the revision"
+echo ""
+echo "Environment variables to set in Azure Portal:"
+echo "  - OPENAI_API_KEY"
+echo "  - TAVILY_API_KEY"
+echo "  - USE_MONGODB_STORAGE=true"
+echo "  - CHAT_AGENT_URL=https://stokai-dev.azurewebsites.net"
+echo "  - SERVICE_TOKEN=<your-service-token>"
+echo "  - DEFAULT_ORG_ID=<your-org-id>"
+echo "  - ALLOWED_ORIGINS=https://stokai-dev.azurewebsites.net,https://meeting-agent.yellowdesert-a5580b23.eastus2.azurecontainerapps.io"
+echo "  - PORT=8000"
