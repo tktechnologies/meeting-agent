@@ -14,5 +14,5 @@ else
     python -m agent.cli init-db --org "${DEFAULT_ORG_ID:-org_demo}"
 fi
 
-echo "✓ Starting API server..."
-python -m agent.api
+echo "✓ Starting API server on port ${PORT:-8000}..."
+exec uvicorn agent.api:app --host 0.0.0.0 --port "${PORT:-8000}"
