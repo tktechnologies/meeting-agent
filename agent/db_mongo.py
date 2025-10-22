@@ -45,7 +45,7 @@ class MongoDBAdapter:
         self.service_token = service_token or os.getenv('SERVICE_TOKEN')
         self.headers = {'Content-Type': 'application/json'}
         if self.service_token:
-            self.headers['x-service-token'] = self.service_token
+            self.headers['Authorization'] = f'Bearer {self.service_token}'
     
     def _request(self, method: str, endpoint: str, **kwargs) -> httpx.Response:
         """Synchronous HTTP request wrapper"""
