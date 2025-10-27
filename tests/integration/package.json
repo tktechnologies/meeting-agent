@@ -1,0 +1,25 @@
+{
+  "name": "meeting-deepresearch-integration-tests",
+  "version": "1.0.0",
+  "description": "Node.js integration tests for Meeting Agent + Deep Research",
+  "main": "node-client.js",
+  "scripts": {
+    "test": "node node-client.js",
+    "test:simple": "node simple-health-test.js",
+    "test:health": "node -e \"require('./node-client').testHealthChecks().then(r => process.exit(r ? 0 : 1))\"",
+    "test:deepresearch": "node -e \"require('./node-client').testDeepResearch().then(r => process.exit(r ? 0 : 1))\"",
+    "test:meeting": "node -e \"require('./node-client').testMeetingAgentQuick().then(r => process.exit(r ? 0 : 1))\"",
+    "test:integration": "node -e \"require('./node-client').testFullIntegration().then(r => process.exit(r ? 0 : 1))\""
+  },
+  "keywords": [
+    "meeting-agent",
+    "deep-research",
+    "integration",
+    "tests"
+  ],
+  "author": "TK Technologies",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0"
+  }
+}

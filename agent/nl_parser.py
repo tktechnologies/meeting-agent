@@ -1,0 +1,194 @@
+import re
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
+
+from .config import default_timezone, default_window_days, default_duration_minutes
+
+
+@dataclass
+class AgendaNLRequest:
+    text: str
+    org_hint: Optional[str]
+    meeting_hint: Optional[str]
+    subject: Optional[str]
+    window_days: int
+    target_duration_minutes: int
+    language: str
+    timezone: str
+
+
+def _detect_language(text: str) -> str:
+    s = (text or "").lower()
+    # Token-based heuristic to avoid substring false positives
+    words = re.findall(r"[a-záéíóúâêôãõç]+", s)
+    if not words:
+        return "en-US"
+    pt_tokens = {"sobre", "reunião", "proxima", "próxima", "amanha", "amanhã", "sexta", "terça", "terca", "quarta", "interno", "interna"}
+    en_tokens = {"about", "meeting", "today", "tomorrow", "monday", "tuesday", "wednesday", "thursday", "friday"}
+    pt = sum(1 for w in words if w in pt_tokens)
+    en = sum(1 for w in words if w in en_tokens)
+    has_accents = any(ch in s for ch in "áéíóúâêôãõç")
+    if pt > en or (pt == en and has_accents):
+        return "pt-BR"
+    return "en-US"
+
+
+def _extract_subject(text: str, lang: str) -> Optional[str]:
+    s = text.strip()
+    if not s:
+        return None
+    if lang == "pt-BR":
+        # sobre <assunto>
+        m = re.search(r"(?i)\bsobre\s+(.+)$", s)
+        if m:
+            out = m.group(1).strip().strip(". ")
+            out = re.sub(r"\s*\([^)]*\)\s*$", "", out)  # drop trailing (..)
+            return out
+    else:
+        # about <subject>
+        m = re.search(r"(?i)\babout\s+(.+)$", s)
+        if m:
+            out = m.group(1).strip().strip(". ")
+            out = re.sub(r"\s*\([^)]*\)\s*$", "", out)  # drop trailing (..)
+            return out
+    # fallback: last comma-delimited chunk if it seems like a topic
+    parts = [p.strip() for p in re.split(r"[,:]", s) if p.strip()]
+    if parts:
+        tail = parts[-1]
+        # discard common date/time tokens
+        if not re.search(r"(?i)today|tomorrow|next|\bseg|ter|qua|qui|sex|sab|dom|segunda|terça|quarta|quinta|sexta", tail):
+            return tail
+    return None
+
+
+def _extract_duration_minutes(text: str, lang: str) -> Optional[int]:
+    """Best-effort extraction of duration in minutes from free text.
+
+    Supports patterns like:
+      - 90 min / 90 minutes
+      - 60m
+      - 1h / 1h30 / 1 h 30
+      - meia hora / uma hora / uma hora e meia (pt-BR)
+      - half an hour / one hour / one hour and a half (en)
+    Returns None if no reliable signal found. Enforces a minimum of 5 minutes.
+    """
+    s = (text or "").lower().strip()
+    if not s:
+        return None
+    import re as _re
+    # Hours with optional minutes: 1h, 2h30, 1 h 05
+    m = _re.search(r"\b(\d{1,2})\s*h(?:\s*(\d{1,2}))?\b", s)
+    if m:
+        h = int(m.group(1))
+        mm = int(m.group(2) or 0)
+        if mm >= 60:  # guard against typos like 1h90
+            mm = 0
+        return max(5, h * 60 + mm)
+    # Explicit minutes: 45 min / 45 mins / 45 minutes
+    m = _re.search(r"\b(\d{1,3})\s*(?:min|mins|minutes?)\b", s)
+    if m:
+        return max(5, int(m.group(1)))
+    # Shorthand 60m, 30m
+    m = _re.search(r"\b(\d{1,3})\s*m\b", s)
+    if m:
+        return max(5, int(m.group(1)))
+    # Portuguese verbal expressions
+    if lang == "pt-BR":
+        if _re.search(r"\bmeia\s+hora\b", s):
+            return 30
+        if _re.search(r"\buma\s+hora(?:\s+e\s+meia)?\b", s):
+            return 90 if "meia" in s else 60
+    else:
+        if _re.search(r"\bhalf\s+an?\s+hour\b", s):
+            return 30
+        if _re.search(r"\bone\s+hour(?:\s+and\s+a?\s+half)?\b", s):
+            return 90 if "half" in s else 60
+    return None
+
+
+def _extract_org_hint(text: str) -> Optional[str]:
+    """Extract an organization hint from free text.
+
+    Improvements:
+    - Stop at punctuation (. ; : ! ?) and known delimiters to avoid over-capture.
+    - Strip leading articles/prepositions (da, do, de, the, a, o...).
+    - Cap length to avoid capturing entire phrases.
+    """
+    # Common cleaner
+    def _clean(s: str) -> str:
+        s = s.strip().strip(". ")
+        s = re.sub(r"^(?:the|da|do|de|d’|d'|a|o|as|os)\s+", "", s, flags=re.IGNORECASE)
+        # stop at punctuation if present
+        s = re.split(r"[\.;:!?]", s)[0].strip()
+        # cap at ~40 chars to avoid accidental long phrases
+        return s[:40]
+
+    patterns = [
+        r"(?i)\bfor\s+(.+?)\s*(?=(about|on|,|$|today|tomorrow|next\s+\w+|\.|;|:|!|\?))",
+        r"(?i)\bpara\s+(.+?)\s*(?=(sobre|,|$|hoje|amanhã|próxima\s+\w+|\.|;|:|!|\?))",
+        r"(?i)\bagenda\s+(?:da|do|de)?\s*(.+?)\s*(?=(sobre|about|,|$|hoje|amanhã|today|tomorrow|next\s+\w+|\.|;|:|!|\?))",
+        r"(?i)\bcom\s+(?:a|o|as|os)?\s*(.+?)\s*(?=(sobre|,|$|hoje|amanhã|próxima\s+\w+|\.|;|:|!|\?))",
+        r"(?i)\bwith\s+(?:the\s+)?(.+?)\s*(?=(about|on|,|$|today|tomorrow|next\s+\w+|\.|;|:|!|\?))",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            out = _clean(m.group(1))
+            if out:
+                return out
+    return None
+
+
+def _extract_meeting_hint(text: str) -> Optional[str]:
+    # MVP: keep as raw phrase like "next Tuesday", "hoje", etc.
+    m = re.search(r"(?i)(today|tomorrow|next\s+\w+|hoje|amanhã|próxima\s+\w+)", text)
+    if m:
+        return m.group(1)
+    return None
+
+
+def parse_nl(text: str, defaults: Optional[Dict[str, Any]] = None) -> AgendaNLRequest:
+    defaults = defaults or {}
+    lang = _detect_language(text)
+    tz = defaults.get("timezone") or default_timezone()
+    window_days = int(defaults.get("window_days") or default_window_days())
+    minutes_hint = _extract_duration_minutes(text, lang)
+    minutes = int(defaults.get("target_duration_minutes") or minutes_hint or default_duration_minutes())
+    org = defaults.get("org_name") or _extract_org_hint(text)
+    mt_hint = _extract_meeting_hint(text)
+    subject = defaults.get("subject") or _extract_subject(text, lang)
+    # Optional: fuzzy fallback for org when hint is empty or too long
+    if (not org or len(org) >= 20) and text:
+        try:
+            from . import db
+            hay = text.lower()
+            best = None
+            for r in db.list_orgs():
+                def _get(row, key: str):
+                    try:
+                        return row[key]
+                    except Exception:
+                        try:
+                            return row.get(key)
+                        except Exception:
+                            return None
+                for key in (_get(r, "org_id"), _get(r, "name")):
+                    k = ((key or "")).lower()
+                    if k and k in hay:
+                        if best is None or len(k) > len(best[0]):
+                            best = (k, _get(r, "org_id"))
+            if best:
+                org = best[1]
+        except Exception:
+            pass
+
+    return AgendaNLRequest(
+        text=text,
+        org_hint=org,
+        meeting_hint=mt_hint,
+        subject=subject,
+        window_days=window_days,
+        target_duration_minutes=minutes,
+        language=lang,
+        timezone=tz,
+    )

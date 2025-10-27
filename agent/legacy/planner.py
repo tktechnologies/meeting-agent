@@ -1,0 +1,1200 @@
+﻿import hashlib
+import json
+from typing import Any, Dict, List, Optional, Sequence
+import re
+
+from .. import db_router as db
+from .. import retrieval
+from ..config import DEFAULT_ORG_ID
+
+
+DEFAULT_FACT_TYPES = (
+    "decision",
+    "action_item",
+    "risk",
+    "milestone",
+    "question",
+    "topic",
+    "objective",
+    "insight",
+    "meeting_metadata",
+)
+
+SECTION_TEMPLATES = [
+    ("Context", {"topic", "objective", "insight", "context", "meeting_metadata"}),
+    ("Key Decisions", {"decision", "decision_needed"}),
+    ("Risks & Blockers", {"risk", "blocker"}),
+    ("Milestones", {"milestone", "deadline"}),
+    ("Action Items", {"action_item", "task"}),
+    ("Open Questions", {"question", "open_question"}),
+]
+
+
+def _section_labels_next(language: str) -> List[Dict[str, str]]:
+    if language == "pt-BR":
+        return [
+            {"key": "alignments", "title": "Alinhamentos"},
+            {"key": "open_questions", "title": "Perguntas em aberto"},
+            {"key": "decisions", "title": "Decisões"},
+            {"key": "risks", "title": "Riscos"},
+            {"key": "integrations", "title": "Integrações e dependências"},
+            {"key": "next_steps", "title": "Próximos passos"},
+        ]
+    return [
+        {"key": "alignments", "title": "Alignments"},
+        {"key": "open_questions", "title": "Open Questions"},
+        {"key": "decisions", "title": "Decisions"},
+        {"key": "risks", "title": "Risks"},
+        {"key": "integrations", "title": "Integrations & Dependencies"},
+        {"key": "next_steps", "title": "Next Steps"},
+    ]
+
+
+def _short_text_from_payload(payload: Dict[str, Any]) -> Optional[str]:
+    for key in ("subject", "title", "name", "headline", "summary", "text"):
+        val = (payload or {}).get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def _refine_phrase(text: str, language: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+    low = s.lower()
+    # Remove common lead-ins (PT/EN)
+    lead_pt = [
+        r"^temos\s+um[au]?\s+", r"^tem\s+um[au]?\s+", r"^estamos\s+", r"^a\s+gente\s+", r"^vamos\s+",
+        r"^que\s+fala\s+s[oó]\s+de\s+", r"^ent[aã]o\s+", r"^aqui\s+", r"^eu\s+", r"^porque\s+", r"^ok\s+", r"^bom\s+", r"^tipo\s+", r"^n[ée]\s+", r"^assim\s+",
+    ]
+    lead_en = [r"^we\s+have\s+", r"^there\s+is\s+", r"^we'?re\s+", r"^we\s+are\s+"]
+    import re
+    for p in (lead_pt if language == "pt-BR" else lead_en):
+        s = re.sub(p, "", s, flags=re.IGNORECASE)
+    # Trim trailing clauses
+    tails_pt = [r"\b(a|à)\s+medida\s+em?\s+que\b.*$", r"\bquando\b.*$", r"\bse\b.*$"]
+    tails_en = [r"\bwhen\b.*$", r"\bif\b.*$"]
+    for p in (tails_pt if language == "pt-BR" else tails_en):
+        s = re.sub(p, "", s, flags=re.IGNORECASE)
+    s = s.strip().strip("…").strip(" .,:-;")
+    # Shorten
+    if len(s) > 72:
+        # Prefer cutting at comma or coordinator
+        options = ([",", " e "] if language == "pt-BR" else [",", " and "])
+        cuts = [s.lower().find(tok) for tok in options]
+        cuts = [c for c in cuts if 0 < c < 72]
+        if cuts:
+            s = s[: max(cuts)]
+        else:
+            s = s[:72].rstrip()
+    # Capitalize
+    if s:
+        s = s[0].upper() + s[1:]
+    return s
+
+
+def _keywords_phrase(texts: Sequence[str], language: str) -> Optional[str]:
+    import re
+    toks: List[str] = []
+    for t in texts:
+        if not isinstance(t, str):
+            continue
+        # basic tokenization; keep unicode letters
+        toks.extend([w.lower() for w in re.findall(r"[\wÀ-ÿ]+", t)])
+    # Drop very short tokens
+    toks = [w for w in toks if len(w) >= 3]
+    # Drop tokens without vowels (likely IDs/fragments)
+    vowels = set("aeiouáéíóúâêôãõà")
+    toks = [w for w in toks if any(ch in vowels for ch in w)]
+    if not toks:
+        return None
+    stop_pt = {"de","da","do","das","dos","e","em","para","por","que","uma","um","uns","umas","na","no","nas","nos","com","sobre","ao","a","o","as","os","pra","pro","então","entao","essa","esse","isso","aqui","eu","ok","bom","tipo","né","ne","assim","porque","tá","ta","ai","aí","ai"}
+    stop_en = {"the","and","for","with","a","an","of","in","on","to","by","about","from","as","at","is","are","this","that"}
+    stop = stop_pt if language == "pt-BR" else stop_en
+    from collections import Counter
+    freq = Counter([w for w in toks if w not in stop])
+    if not freq:
+        return None
+    top = [w for (w, _c) in freq.most_common(6)]
+    if language == "pt-BR":
+        phrase = " ".join(top[:3]).strip()
+        phrase = _refine_phrase(phrase, language) if phrase else None
+        return phrase.capitalize() if phrase else None
+    phrase = " ".join(top[:3]).strip()
+    phrase = _refine_phrase(phrase, language) if phrase else None
+    return phrase.title() if phrase else None
+
+
+def _abstract_text_from_fact(fact: Dict[str, Any], language: str) -> Optional[str]:
+    payload = fact.get("payload") or {}
+    # Prefer payload subject/title, refined
+    t = _short_text_from_payload(payload)
+    t = _refine_phrase(t or "", language) if t else None
+    if t:
+        return t
+    # Else synthesize from payload strings and entities (avoid evidence quotes)
+    texts: List[str] = []
+    for k in ("subject", "title", "name", "headline", "summary", "text"):
+        val = payload.get(k)
+        if isinstance(val, str) and val.strip():
+            texts.append(val.strip())
+    for ent in (fact.get("entities") or []):
+        dn = ent.get("display_name")
+        if isinstance(dn, str) and dn.strip():
+            texts.append(dn.strip())
+    phrase = _keywords_phrase(texts, language)
+    return phrase
+
+
+def _quality_score(text: str, language: str) -> float:
+    s = (text or "").strip()
+    if not s:
+        return 0.0
+    import re
+    # Token and alpha ratio checks
+    tokens = re.findall(r"[\wÀ-ÿ]+", s)
+    if len(tokens) < 3:
+        return 0.1
+    alpha = sum(ch.isalpha() for ch in s)
+    ratio = alpha / max(1, len(s))
+    score = 0.3 + 0.5 * min(1.0, ratio)
+    # Penalize bad starts/ends and filler heads
+    bad_heads_pt = ["eu ", "a gente ", "aqui ", "então ", "olha "]
+    bad_heads_en = ["i ", "we ", "here ", "so ", "well "]
+    bad_heads = bad_heads_pt if language == "pt-BR" else bad_heads_en
+    low = s.lower()
+    if any(low.startswith(h) for h in bad_heads):
+        score -= 0.2
+    last = tokens[-1].lower()
+    stop_pt = {"de","da","do","das","dos","e","em","para","por","que","uma","um","na","no","pra","pro"}
+    stop_en = {"the","and","for","with","a","an","of","in","on","to","by","about","from","as","at","is","are"}
+    stop = stop_pt if language == "pt-BR" else stop_en
+    if last in stop:
+        score -= 0.2
+    # Penalize likely truncated words
+    if language == "pt-BR" and (last.endswith("çã") or last.endswith("negóci") or last.endswith("inform") or last.endswith("cont") or last.endswith("cadast")):
+        score -= 0.3
+    # Penalize trailing conjunctions (often truncated)
+    last_word = (tokens[-1] or "").lower()
+    if last_word in {"e", "mas", "porque", "então", "entao", "and", "but", "because", "so"}:
+        score -= 0.2
+    return max(0.0, min(1.0, score))
+
+
+def _infer_kind_from_text(text: str, language: str) -> Optional[str]:
+    s = (text or "").strip()
+    if not s:
+        return None
+    low = s.lower()
+    # Question signals (even if missing '?', we look for interrogatives)
+    pt_q = [r"\?$", r"\bpor\s+que\b", r"\bcomo\b", r"\bquando\b", r"\bonde\b", r"\bo\s+que\b", r"\bqual\b", r"\bquais\b", r"\bquem\b", r"\bse\b", r"\bpergunta\b"]
+    en_q = [r"\?$", r"\bwhy\b", r"\bhow\b", r"\bwhen\b", r"\bwhere\b", r"\bwhat\b", r"\bwhich\b", r"\bwho\b", r"\bif\b", r"\bquestion\b"]
+    q_patterns = pt_q if language == "pt-BR" else en_q
+    if any(re.search(p, low) for p in q_patterns):
+        return "question"
+    # Decision signals
+    pt_dec = [
+        r"\bdecid(?:ir|ir\s+se|ir\s+por)?\b", r"\bdecis[aã]o\b", r"\baprovar\b", r"\baprova[cç][aã]o\b", r"\bescolher\b", r"\bconfirmar\b", r"\bvalidar\b", r"\bdefinir\b", r"\bfechar\b",
+        r"\bpriorizar\b", r"\bdestravar\b", r"\balocar\b", r"\bassinar\b", r"\bcontratar\b", r"\bhomologar\b",
+    ]
+    en_dec = [r"\bdecid(?:e|e\s+if|e\s+on)\b", r"\bdecision\b", r"\bapprove\b", r"\bapproval\b", r"\bchoose\b", r"\bconfirm\b", r"\bvalidate\b", r"\bdefine\b", r"\bfinali[sz]e\b"]
+    dec_patterns = pt_dec if language == "pt-BR" else en_dec
+    if any(re.search(p, low) for p in dec_patterns):
+        return "decision"
+    # Risk signals
+    pt_risk = [r"\brisco\b", r"\briscos\b", r"\bbloqueio\b", r"\bbloqueador\b", r"\bimpedimento\b", r"\bproblema\b", r"\bfalha\b", r"\batraso\b", r"\bn[ãa]o\s+conformidade\b", r"\blgpd\b", r"\bseguran[cç]a\b"]
+    en_risk = [r"\brisk\b", r"\brisks\b", r"\bblocker\b", r"\bimpediment\b", r"\bissue\b", r"\bfailure\b", r"\bdelay\b", r"\bnon\-?compliance\b", r"\blgpd\b", r"\bsecurity\b"]
+    risk_patterns = pt_risk if language == "pt-BR" else en_risk
+    if any(re.search(p, low) for p in risk_patterns):
+        return "risk"
+    # Integration/Dependency signals
+    pt_int = [r"\bintegra(ç|c)[aã]o\b", r"\bapis?\b", r"\bdepend[êe]ncia\b", r"\bprocesso\b", r"\bpipeline\b", r"\bprotocolo\b", r"\bwebhook\b", r"\bendpoints?\b", r"\besquema\b", r"\bmapeamento\b"]
+    en_int = [r"\bintegration\b", r"\bapis?\b", r"\bdependenc(y|ies)\b", r"\bprocess\b", r"\bpipeline\b", r"\bprotocol\b", r"\bwebhook\b", r"\bendpoints?\b", r"\bschema\b", r"\bmapping\b"]
+    int_patterns = pt_int if language == "pt-BR" else en_int
+    if any(re.search(p, low) for p in int_patterns):
+        return "integration"
+    # Action/Next-step signals
+    pt_act = [r"\bpr[óo]ximo\s+passo\b", r"\ba[cç][aã]o\b", r"\btarefa\b", r"\bentregar\b", r"\bimplementar\b", r"\bcriar\b", r"\bfazer\b", r"\bplanejar\b", r"\bplanejamento\b", r"\bacompanhar\b"]
+    en_act = [r"\bnext\s+step\b", r"\baction\b", r"\btask\b", r"\bdeliver\b", r"\bimplement\b", r"\bcreate\b", r"\bdo\b", r"\bplan\b", r"\bplanning\b", r"\bfollow\s*up\b"]
+    act_patterns = pt_act if language == "pt-BR" else en_act
+    if any(re.search(p, low) for p in act_patterns):
+        return "action_item"
+    # Metrics/Objectives
+    pt_metric = [r"\bm(é|e)trica\b", r"\bmeta\b", r"\bobjetivo\b"]
+    en_metric = [r"\bmetric\b", r"\btarget\b", r"\bobjective\b", r"\bgoal\b"]
+    metric_patterns = pt_metric if language == "pt-BR" else en_metric
+    if any(re.search(p, low) for p in metric_patterns):
+        return "metric"
+    return None
+
+
+def _derive_next_bullets(candidates: Sequence[Dict[str, Any]], language: str) -> Dict[str, List[Dict[str, Any]]]:
+    # key -> list of bullets
+    res: Dict[str, List[Dict[str, Any]]] = {
+        "alignments": [],
+        "open_questions": [],
+        "decisions": [],
+        "integrations": [],
+        "risks": [],
+        "next_steps": [],
+    }
+    seen_texts = set()
+    for fact in candidates:
+        ftype = (fact.get("fact_type") or "").lower()
+        text = _abstract_text_from_fact(fact, language)
+        if not text:
+            continue
+        if _quality_score(text, language) < 0.65:
+            # Try to synthesize from payload strings only
+            payload = fact.get("payload") or {}
+            synth = _keywords_phrase([
+                payload.get("subject"), payload.get("title"), payload.get("headline"), payload.get("summary"), payload.get("text")
+            ], language)
+            text = _refine_phrase(synth or "", language) if synth else None
+            if not text or _quality_score(text, language) < 0.65:
+                continue
+        inferred = _infer_kind_from_text(text, language)
+        if inferred:
+            ftype = inferred
+        # Deduplicate by normalized text key to avoid repeated bullets
+        norm_key = (text or "").strip().lower().rstrip(" .:;?!")
+        if norm_key in seen_texts:
+            continue
+        seen_texts.add(norm_key)
+        bullet = {
+            "text": text,
+            "owner": (fact.get("payload") or {}).get("owner"),
+            "due": fact.get("due_iso") or fact.get("due_at"),
+            "source_fact_id": fact.get("fact_id"),
+        }
+        # Attach reference to the originating fact
+        try:
+            retrieval._attach_ref(bullet, fact)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        # Classify with forward-looking orientation
+        if ftype in {"question", "open_question"}:
+            if language == "pt-BR":
+                bullet["text"] = ("Responder: " + text.rstrip(".?") + "?")
+            else:
+                bullet["text"] = ("Answer: " + text.rstrip(".?") + "?")
+            res["open_questions"].append(bullet)
+        elif ftype in {"decision", "decision_needed"}:
+            if language == "pt-BR":
+                bullet["text"] = ("Decidir: " + text.rstrip(". "))
+            else:
+                bullet["text"] = ("Decide: " + text.rstrip(". "))
+            res["decisions"].append(bullet)
+        elif ftype in {"risk", "blocker"}:
+            if language == "pt-BR":
+                bullet["text"] = ("Mitigar: " + text.rstrip("."))
+            else:
+                bullet["text"] = ("Mitigate: " + text.rstrip("."))
+            res["risks"].append(bullet)
+        elif ftype in {"integration", "dependency", "process_step"}:
+            if language == "pt-BR":
+                bullet["text"] = ("Próximo passo de integração/processo: " + text.rstrip("."))
+            else:
+                bullet["text"] = ("Next step for integration/process: " + text.rstrip("."))
+            res["integrations"].append(bullet)
+        elif ftype in {"action_item", "task", "milestone", "deadline"}:
+            if language == "pt-BR":
+                bullet["text"] = ("Acompanhar ação: " + text.rstrip("."))
+            else:
+                bullet["text"] = ("Follow up action: " + text.rstrip("."))
+            res["next_steps"].append(bullet)
+        elif ftype in {"metric", "objective", "insight", "topic"}:
+            if language == "pt-BR":
+                bullet["text"] = ("Alinhar: " + text.rstrip("."))
+            else:
+                bullet["text"] = ("Align: " + text.rstrip("."))
+            res["alignments"].append(bullet)
+        else:
+            # reference/other → put into alignments
+            if language == "pt-BR":
+                bullet["text"] = ("Alinhar: " + text.rstrip("."))
+            else:
+                bullet["text"] = ("Align: " + text.rstrip("."))
+            res["alignments"].append(bullet)
+    return res
+
+
+def _fill_core_sections(buckets: Dict[str, List[Dict[str, Any]]], language: str) -> Dict[str, List[Dict[str, Any]]]:
+    # Derive conservative placeholders for empty core sections from existing bullets
+    def _base_text(txt: str) -> str:
+        t = (txt or "").strip()
+        # Drop common prefixes we added
+        for pref in [
+            "Alinhar: ", "Align: ",
+            "Próximo passo de integração/processo: ", "Next step for integration/process: ",
+            "Acompanhar ação: ", "Follow up action: ",
+        ]:
+            if t.startswith(pref):
+                return t[len(pref):].strip()
+        return t
+
+    # Open Questions from Alignments
+    if not buckets.get("open_questions"):
+        src = (buckets.get("alignments") or [])[:2]
+        derived = []
+        import re as _re
+        for b in src:
+            base = _base_text(b.get("text") or "")
+            if not base:
+                continue
+            base_low = base.lower().strip()
+            is_inf = bool(_re.match(r"^(definir|escolher|priorizar|alocar|aprovar|homologar|contratar)\b", base_low))
+            if language == "pt-BR":
+                prefix = "Decidir: " if is_inf else "Responder: "
+                txt = prefix + base.rstrip(".?") + ("?" if not base.endswith("?") else "")
+            else:
+                prefix = "Decide: " if is_inf else "Answer: "
+                txt = prefix + base.rstrip(".?") + ("?" if not base.endswith("?") else "")
+            derived.append({"text": txt, "source_fact_id": b.get("source_fact_id")})
+        if derived:
+            buckets.setdefault("open_questions", []).extend(derived)
+
+    # Decisions from Alignments
+    if not buckets.get("decisions"):
+        src = (buckets.get("alignments") or [])[:2]
+        derived = []
+        for b in src:
+            base = _base_text(b.get("text") or "")
+            if not base:
+                continue
+            txt = ("Decidir: " + base.rstrip(". ")) if language == "pt-BR" else ("Decide: " + base.rstrip(". "))
+            derived.append({"text": txt, "source_fact_id": b.get("source_fact_id")})
+        if derived:
+            buckets.setdefault("decisions", []).extend(derived)
+
+    # Risks from Integrations/Next Steps keywords (aggregate into a single synthesized risk)
+    if not buckets.get("risks"):
+        src = (buckets.get("integrations") or []) + (buckets.get("next_steps") or [])
+        bases: List[str] = []
+        seen = set()
+        for b in src:
+            base = _base_text(b.get("text") or "")
+            low = base.lower()
+            if not base:
+                continue
+            if any(k in low for k in ["api", "integra", "dependenc", "depende", "pipeline", "protocolo", "webhook", "endpoint", "schema", "esquema"]):
+                key = low
+                if key not in seen:
+                    seen.add(key)
+                    bases.append(base)
+        if bases:
+            if language == "pt-BR":
+                joined = "; ".join(bases[:3]) + ("…" if len(bases) > 3 else "")
+                txt = f"Mitigar: possíveis atrasos/bloqueios nas integrações previstas ({joined})"
+            else:
+                joined = "; ".join(bases[:3]) + ("…" if len(bases) > 3 else "")
+                txt = f"Mitigate: potential delays/blockers in planned integrations ({joined})"
+            buckets.setdefault("risks", []).append({"text": txt})
+    return buckets
+
+
+def _build_sections_next(buckets: Dict[str, List[Dict[str, Any]]], total_minutes: int, language: str, company_context: Optional[str]) -> List[Dict[str, Any]]:
+    sections: List[Dict[str, Any]] = []
+    labels = _section_labels_next(language)
+    core_keys = {"alignments", "open_questions", "decisions", "risks"}
+    # Always render core sections; include optional ones only if they have items
+    keys_to_render: List[str] = []
+    for lab in labels:
+        k = lab["key"]
+        if k in core_keys or (buckets.get(k)):
+            keys_to_render.append(k)
+    # Context section at top (short)
+    context_minutes = 0
+    if company_context and company_context.strip():
+        context_minutes = max(3, int(total_minutes * 0.1))  # ~10% or min 3
+    # Optional context section at top
+    if company_context and company_context.strip():
+        ctx_title = "Contexto da empresa" if language == "pt-BR" else "Company Context"
+        sections.append({
+            "title": ctx_title,
+            "minutes": context_minutes,
+            "items": [{"heading": ctx_title, "bullets": [{"text": company_context.strip()}]}],
+        })
+    # Compute weighted minutes for remaining sections
+    available = max(0, total_minutes - context_minutes)
+    # Weights: non-empty sections get higher weight; empty core get minimal presence
+    weights: Dict[str, int] = {}
+    for lab in labels:
+        key = lab["key"]
+        if key not in keys_to_render:
+            continue
+        items = buckets.get(key) or []
+        n = len(items)
+        if n > 0:
+            weights[key] = 2 + min(5, n)  # cap influence
+        else:
+            # empty core sections still get small timebox
+            weights[key] = 1
+    total_weight = sum(weights.values()) or 1
+    # Initial allocation
+    alloc: Dict[str, int] = {}
+    for key, w in weights.items():
+        base_min = 3 if len(buckets.get(key) or []) == 0 else 5
+        minutes_i = max(base_min, int(available * (w / total_weight)))
+        alloc[key] = minutes_i
+    # Adjust rounding to match available minutes
+    diff = available - sum(alloc.values())
+    if diff != 0:
+        # Give/take minutes from the heaviest sections first
+        order = sorted(alloc.keys(), key=lambda k: weights[k], reverse=True)
+        i = 0
+        step = 1 if diff > 0 else -1
+        while diff != 0 and order:
+            k = order[i % len(order)]
+            new_val = alloc[k] + step
+            if new_val >= (3 if len(buckets.get(k) or []) == 0 else 5):
+                alloc[k] = new_val
+                diff -= step
+            i += 1
+            if i > 1000:
+                break
+    # Ensure at least one alignment item exists for future meetings (guarantees alignment focus)
+    if not (buckets.get("alignments") or []):
+        if language == "pt-BR":
+            buckets["alignments"] = [{"text": "Alinhar: objetivos e critérios da reunião"}]
+        else:
+            buckets["alignments"] = [{"text": "Align: meeting goals and decision criteria"}]
+
+    # Emit sections
+    for lab in labels:
+        key = lab["key"]
+        if key not in keys_to_render:
+            continue
+        items = buckets.get(key) or []
+        sections.append({
+            "title": lab["title"],
+            "minutes": alloc.get(key, 5),
+            "items": ([{"heading": lab["title"], "bullets": items[:4]}] if items else []),
+        })
+    return sections
+
+
+def _first_non_empty(*values: Any) -> Optional[str]:
+    for val in values:
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def _bullet_from_fact(fact: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    payload = fact.get("payload") or {}
+    entities = fact.get("entities") or []
+    lang = "pt-BR" if (fact.get("lang") == "pt-BR") else "en-US"
+    text = _abstract_text_from_fact(fact, language=lang) or _short_text_from_payload(payload)
+    if not text:
+        return None
+    if _quality_score(text, lang) < 0.65:
+        synth = _keywords_phrase([
+            payload.get("subject"), payload.get("title"), payload.get("headline"), payload.get("summary"), payload.get("text")
+        ], lang)
+        text = _refine_phrase(synth or "", lang) if synth else ""
+        if _quality_score(text, lang) < 0.65:
+            return None
+    owner = payload.get("owner")
+    # Only infer owner heuristically for non-PT locales to avoid hallucinated owners in PT agendas
+    if not owner and lang != "pt-BR":
+        for ent in entities:
+            if (ent.get("type") or "").lower() == "person":
+                owner = ent.get("display_name")
+                break
+    due = payload.get("due") or fact.get("due_iso") or fact.get("due_at")
+    bullet = {
+        "text": text,
+        "owner": owner,
+        "due": due,
+        "source_fact_id": fact.get("fact_id"),
+    }
+    # Attach reference to the originating fact
+    try:
+        retrieval._attach_ref(bullet, fact)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return bullet
+
+
+def _categorise_candidates(candidates: Sequence[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    buckets: Dict[str, List[Dict[str, Any]]] = {
+        title: [] for title, _ in SECTION_TEMPLATES
+    }
+    seen_texts: set[str] = set()
+    meeting_meta_count = 0
+    for fact in candidates:
+        bullet = _bullet_from_fact(fact)
+        if not bullet:
+            continue
+        fact_type = (fact.get("fact_type") or "").lower()
+        # Cap soft/context items to avoid crowding
+        if fact_type == "meeting_metadata":
+            if meeting_meta_count >= 2:
+                continue
+            meeting_meta_count += 1
+
+        # Dedupe by normalized bullet text
+        norm_key = (bullet.get("text") or "").strip().lower().rstrip(" .:;?!")
+        if not norm_key:
+            continue
+        if norm_key in seen_texts:
+            continue
+        seen_texts.add(norm_key)
+        placed = False
+        for title, accepted in SECTION_TEMPLATES:
+            if fact_type in accepted:
+                buckets[title].append(bullet)
+                placed = True
+                break
+        if not placed:
+            buckets[SECTION_TEMPLATES[0][0]].append(bullet)
+    return buckets
+
+
+def _build_sections(buckets: Dict[str, List[Dict[str, Any]]], total_minutes: int) -> List[Dict[str, Any]]:
+    sections: List[Dict[str, Any]] = []
+    active = [(title, buckets.get(title) or []) for title, _ in SECTION_TEMPLATES if buckets.get(title)]
+    if not active:
+        return sections
+
+    # Weight grows with bullet count but is capped to avoid runaway sections
+    weights = {title: 2 + min(5, len(bullets)) for title, bullets in active}
+    total_weight = sum(weights.values()) or 1
+    MIN = 5
+
+    # Initial allocation (rounded)
+    alloc = {title: max(MIN, int(total_minutes * weights[title] / total_weight)) for title in weights}
+
+    # Adjust rounding drift to match total_minutes exactly
+    drift = total_minutes - sum(alloc.values())
+    keys_by_weight = sorted(weights, key=lambda k: weights[k], reverse=True)
+    while drift != 0:
+        for k in (keys_by_weight if drift > 0 else reversed(keys_by_weight)):
+            if drift == 0:
+                break
+            if drift > 0:
+                alloc[k] += 1
+                drift -= 1
+            else:
+                if alloc[k] > MIN:
+                    alloc[k] -= 1
+                    drift += 1
+
+    # Build sections (keep existing section + items shape)
+    for title, _ in SECTION_TEMPLATES:
+        bullets = buckets.get(title) or []
+        if not bullets:
+            continue
+        sections.append({
+            "title": title,
+            "minutes": alloc.get(title, MIN),
+            "items": [{
+                "heading": title,
+                "bullets": bullets[:5],
+            }],
+        })
+    return sections
+
+
+def _compute_coverage(buckets: Dict[str, List[Dict[str, Any]]]) -> float:
+    non_empty = sum(1 for items in buckets.values() if items)
+    if non_empty == 0:
+        return 0.0
+    total_bullets = sum(len(items) for items in buckets.values())
+    diversity = non_empty / len(SECTION_TEMPLATES)
+    density = min(1.0, total_bullets / 10.0)
+    return round(0.4 + 0.4 * diversity + 0.2 * density, 2)
+
+
+def _subject_match_score(subject: Optional[str], buckets: Dict[str, List[Dict[str, Any]]], language: str) -> float:
+    if not subject:
+        return 0.0
+    import re
+    subj_toks = {t for t in re.findall(r"\w+", subject.lower()) if len(t) >= 3}
+    if not subj_toks:
+        return 0.0
+    bullet_words: set[str] = set()
+    for items in buckets.values():
+        for b in items:
+            txt = (b.get("text") or "").lower()
+            bullet_words.update(t for t in re.findall(r"\w+", txt) if len(t) >= 3)
+    if not bullet_words:
+        return 0.0
+    overlap = len(subj_toks & bullet_words)
+    return 0.0 if not subj_toks else round(overlap / len(subj_toks), 3)
+
+
+def plan_agenda(
+    org_id: str,
+    subject: Optional[str],
+    candidates: Sequence[Dict[str, Any]],
+    *,
+    duration_minutes: int = 30,
+    language: str = "en-US",
+) -> Dict[str, Any]:
+    org_id = org_id or DEFAULT_ORG_ID
+    buckets = _categorise_candidates(candidates)
+    sections = _build_sections(buckets, duration_minutes)
+    coverage = _compute_coverage(buckets)
+    subj_match = _subject_match_score(subject, buckets, language)
+    title = "Reunião" if language == "pt-BR" else "Meeting"
+    agenda = {
+        "title": title,
+        "minutes": duration_minutes,
+        "sections": sections,
+    }
+    choice = "subject" if subject else "default"
+    reason = "forward-looking heuristics"
+    supporting_fact_ids = [fact.get("fact_id") for fact in candidates if fact.get("fact_id")]
+    proposal = {
+        "agenda": agenda,
+        "choice": choice,
+        "reason": reason,
+        "subject": {
+            "query": subject,
+            "coverage": coverage,
+            "match": subj_match,
+            "facts": len(candidates),
+        },
+        "supporting_fact_ids": supporting_fact_ids,
+    }
+    return proposal
+
+
+def plan_agenda_next(
+    org_id: str,
+    subject: Optional[str],
+    candidates: Sequence[Dict[str, Any]],
+    *,
+    company_context: Optional[str] = None,
+    duration_minutes: int = 30,
+    language: str = "en-US",
+) -> Dict[str, Any]:
+    org_id = org_id or DEFAULT_ORG_ID
+    # Rescue: if subject is missing or low-quality, infer and polish it
+    def _is_low_quality(s: Optional[str]) -> bool:
+        if not s or not s.strip():
+            return True
+        ss = s.strip()
+        # reuse retrieval’s generic check + a light quality gate
+        if retrieval.looks_generic_subject(ss, language):
+            return True
+        # Borrow the phrase quality heuristic from this module
+        return (_quality_score(ss, language) < 0.55)
+
+    if _is_low_quality(subject):
+        inferred = retrieval.infer_best_subject(org_id, language=language)
+        if inferred and not _is_low_quality(inferred):
+            subject = inferred
+
+    # If we have a (now good) subject, always go subject-centered and RAG on it
+    if subject:
+        subj_candidates = retrieval.retrieve_facts_for_subject(org_id, subject, limit=60, language=language)
+        return _plan_agenda_subject_centered(
+            org_id, subject, subj_candidates,
+            company_context=company_context, duration_minutes=duration_minutes, language=language
+        )
+
+    # Fallback: legacy next-meeting flow (unchanged)
+    buckets = _derive_next_bullets(candidates, language)
+    buckets = _fill_core_sections(buckets, language)
+    # Sort bullets within each section by due date (earlier first), then text
+    from datetime import datetime
+
+    def _sort_key(b):
+        due = (b.get("due") or "").strip()
+        # items with due dates first; simple lexical works for ISO strings
+        return (0 if due else 1, due, (b.get("text") or ""))
+
+    for key, items in list(buckets.items()):
+        buckets[key] = sorted(items, key=_sort_key)
+    sections = _build_sections_next(buckets, duration_minutes, language, company_context)
+    # Simple coverage proxy
+    coverage = 1.0 if sections else 0.0
+    title = "Reunião" if language == "pt-BR" else "Meeting"
+    agenda = {"title": title, "minutes": duration_minutes, "sections": sections}
+    choice = "next" if subject else "next-default"
+    reason = "subject coverage" if subject and coverage >= 0.5 and subj_match >= 0.5 else "default template"
+    supporting_fact_ids = [fact.get("fact_id") for fact in candidates if fact.get("fact_id")]
+    return {
+        "agenda": agenda,
+        "choice": choice,
+        "reason": reason,
+        "subject": {"query": subject, "coverage": coverage, "facts": len(candidates)},
+        "supporting_fact_ids": supporting_fact_ids,
+    }
+
+
+def _plan_agenda_subject_centered(
+    org_id: str,
+    subject: str,
+    candidates: Sequence[Dict[str, Any]],
+    *,
+    company_context: Optional[str],
+    duration_minutes: int,
+    language: str,
+) -> Dict[str, Any]:
+    # Build forward-looking buckets from subject-specific candidates
+    buckets = _derive_next_bullets(candidates, language)
+    buckets = _fill_core_sections(buckets, language)
+    # If no bullets at all, fall back to legacy next-meeting derivation using broad candidates
+    total_bullets = sum(len(v) for v in buckets.values())
+    if total_bullets == 0:
+        broad = retrieval.find_candidates_for_agenda(org_id, None, DEFAULT_FACT_TYPES, limit=60)
+        buckets = _derive_next_bullets(broad, language)
+        buckets = _fill_core_sections(buckets, language)
+    # Allocate sections with existing next-meeting allocator (may include Company Context)
+    sections = _build_sections_next(buckets, duration_minutes, language, company_context)
+
+    # Ensure consistent ordering inside core actionable buckets by due then text
+    from datetime import datetime
+    def _sort_key(b):
+        due = (b.get("due") or "").strip()
+        return (0 if due else 1, due, (b.get("text") or ""))
+    for key in ("decisions", "next_steps", "milestones"):
+        if key in buckets:
+            buckets[key] = sorted(buckets[key], key=_sort_key)
+    # Note: sections may exist even with empty items; our bullet-count fallback above addresses emptiness
+    # Prepend a Goal section and a short Why section if possible
+    goal_title = "Meta" if language == "pt-BR" else "Goal"
+    why_title = "Contexto" if language == "pt-BR" else "Why"
+    goal_minutes = max(5, int(duration_minutes * 0.12))
+    goal_sec = {
+        "title": goal_title,
+        "minutes": goal_minutes,
+        "items": [{"heading": goal_title, "bullets": [{"text": subject}]}],
+    }
+    # Build a compact why from evidence snippets or company context
+    why_bullets: List[Dict[str, Any]] = []
+    # prefer evidence quotes to justify subject selection
+    added = 0
+    for fact in candidates:
+        for ev in (fact.get("evidence") or [])[:1]:
+            q = ev.get("quote")
+            if isinstance(q, str) and q.strip():
+                wb = {"text": q.strip()[:180] + ("…" if len(q.strip()) > 180 else "")}
+                # Attach both evidence and fact as refs (renderer will limit per bullet)
+                try:
+                    retrieval._attach_ref(wb, ev)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                try:
+                    retrieval._attach_ref(wb, fact)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                why_bullets.append(wb)
+                added += 1
+                if added >= 2:
+                    break
+        if added >= 2:
+            break
+    if not why_bullets and company_context and company_context.strip():
+        why_bullets.append({"text": company_context.strip()})
+    why_minutes = 5 if why_bullets else 0
+
+    # Rebalance existing section minutes so total fits duration after adding Goal/Why
+    if sections:
+        pool = sum(max(0, s.get("minutes", 0)) for s in sections)
+        take = goal_minutes + why_minutes
+        target = max(5, duration_minutes - take)
+        if pool > 0 and target > 0:
+            ratio = target / pool
+            for s in sections:
+                m = max(0, s.get("minutes", 0))
+                has_items = bool(s.get("items")) and any(it.get("bullets") for it in s.get("items", []))
+                floor_min = 3 if not has_items else 5
+                s["minutes"] = max(floor_min, int(round(m * ratio)))
+            # rounding correction
+            diff = target - sum(s.get("minutes", 0) for s in sections)
+            i = 0
+            max_iters = 500
+            while diff != 0 and sections and i < max_iters:
+                j = i % len(sections)
+                new_val = sections[j]["minutes"] + (1 if diff > 0 else -1)
+                has_items = bool(sections[j].get("items")) and any(it.get("bullets") for it in sections[j].get("items", []))
+                floor_min = 3 if not has_items else 5
+                if new_val >= floor_min:
+                    sections[j]["minutes"] = new_val
+                    diff += (-1 if diff > 0 else 1)
+                i += 1
+            # If still diff after cap, force adjust first section
+            if diff != 0 and sections:
+                sections[0]["minutes"] = max(1, sections[0]["minutes"] + diff)
+                diff = 0
+
+    if why_bullets:
+        why_sec = {"title": why_title, "minutes": why_minutes, "items": [{"heading": why_title, "bullets": why_bullets}]}
+        sections = [goal_sec, why_sec] + sections
+    else:
+        sections = [goal_sec] + sections
+    # Compose proposal
+    title = "Reunião" if language == "pt-BR" else "Meeting"
+    agenda_obj = {"title": title, "minutes": duration_minutes, "sections": sections}
+    supporting = [fact.get("fact_id") for fact in candidates if fact.get("fact_id")]
+    return {
+        "agenda": agenda_obj,
+        "choice": "next-subject",
+        "reason": "subject-focused forward plan",
+        "subject": {"query": subject, "coverage": 1.0 if sections else 0.0, "facts": len(candidates)},
+        "supporting_fact_ids": supporting,
+    }
+
+
+def _compute_idempotency_key(org_id: str, meeting_id: Optional[str], subject: Optional[str], agenda: Dict[str, Any]) -> str:
+    h = hashlib.sha256()
+    h.update((org_id or "").encode("utf-8"))
+    h.update((meeting_id or "").encode("utf-8"))
+    h.update((subject or "").encode("utf-8"))
+    h.update(json.dumps(agenda or {}, sort_keys=True).encode("utf-8"))
+    return h.hexdigest()
+
+
+def persist_agenda_proposal(
+    org_id: str,
+    proposal: Dict[str, Any],
+    *,
+    meeting_id: Optional[str] = None,
+    transcript_id: Optional[str] = None,
+) -> str:
+    agenda_obj = proposal.get("agenda") or {}
+    subject = proposal.get("subject", {}).get("query")
+    idem = _compute_idempotency_key(org_id, meeting_id, subject, agenda_obj)
+    payload = {
+        "kind": "agenda_proposal",
+        "subject": subject,
+        "agenda": agenda_obj,
+        "choice": proposal.get("choice"),
+        "reason": proposal.get("reason"),
+        "supporting_fact_ids": proposal.get("supporting_fact_ids", []),
+    }
+    fact = {
+        "org_id": org_id or DEFAULT_ORG_ID,
+        "meeting_id": meeting_id,
+        "transcript_id": transcript_id,
+        "fact_type": "meeting_metadata",
+        "status": "proposed",
+        "payload": payload,
+        "idempotency_key": idem,
+    }
+    fact_id = db.insert_or_update_fact(fact)
+    proposal["idempotency_key"] = idem
+    return fact_id
+
+
+# ---------------------------------------------------------------------------
+# Macro-aware planning (workstreams → facts → agenda)
+# ---------------------------------------------------------------------------
+
+def plan_agenda_from_workstreams(
+    org_id: str,
+    workstreams: List[Dict[str, Any]],
+    facts: List[Dict[str, Any]],
+    duration_minutes: int,
+    language: str,
+) -> Dict[str, Any]:
+    """Build rich agenda using workstream context and facts.
+    
+    Uses existing subject-centered planning logic enriched with workstream metadata.
+    Returns agenda with _metadata v2.0 including workstreams and refs.
+    """
+    org_id = org_id or DEFAULT_ORG_ID
+    
+    # Build subject from workstream titles
+    if workstreams:
+        if len(workstreams) == 1:
+            subject = workstreams[0].get("title", "")
+        else:
+            # Combine top workstream titles
+            titles = [ws.get("title", "") for ws in workstreams[:3] if ws.get("title")]
+            subject = ", ".join(titles) if titles else None
+    else:
+        subject = None
+    
+    # Use existing subject-centered planning with enriched facts
+    if facts and subject:
+        # Call the proven planning logic
+        proposal = _plan_agenda_subject_centered(
+            org_id,
+            subject,
+            facts,  # Pass facts as candidates
+            company_context=None,
+            duration_minutes=duration_minutes,
+            language=language,
+        )
+    else:
+        # Fallback to next-meeting planning
+        proposal = plan_agenda_next(
+            org_id,
+            subject,
+            facts,
+            company_context=None,
+            duration_minutes=duration_minutes,
+            language=language,
+        )
+    
+    # Enrich with workstream metadata v2.0
+    agenda = proposal.get("agenda", {})
+    if "_metadata" not in agenda:
+        agenda["_metadata"] = {}
+    
+    metadata = agenda["_metadata"]
+    metadata["agenda_v"] = "2.0"
+    metadata["workstreams"] = [
+        {
+            "workstream_id": ws["workstream_id"],
+            "title": ws.get("title", ""),
+            "status": ws.get("status", "green"),
+            "priority": ws.get("priority", 1),
+        }
+        for ws in workstreams
+    ]
+    
+    # Build refs from facts
+    refs = []
+    for fact in facts:
+        evidence = fact.get("evidence") or []
+        why_quote = ""
+        if evidence:
+            for ev in evidence:
+                q = ev.get("quote", "")
+                if isinstance(q, str) and len(q.strip()) > 20:
+                    why_quote = q.strip()[:150]
+                    break
+        
+        refs.append({
+            "fact_id": fact.get("fact_id"),
+            "type": fact.get("fact_type"),
+            "status": fact.get("status"),
+            "quote": why_quote,
+            "workstream_id": fact.get("workstream_id"),
+        })
+    
+    metadata["refs"] = refs
+    proposal["agenda"] = agenda
+    
+    return proposal
+    
+    # Group facts by workstream
+    ws_facts: Dict[str, List[Dict[str, Any]]] = {}
+    unassigned_facts: List[Dict[str, Any]] = []
+    
+    for fact in facts:
+        ws_id = fact.get("workstream_id")
+        if ws_id:
+            ws_facts.setdefault(ws_id, []).append(fact)
+        else:
+            unassigned_facts.append(fact)
+    
+    # Build sections by workstream
+    sections: List[Dict[str, Any]] = []
+    all_refs: List[Dict[str, Any]] = []
+    
+    # Allocate time per workstream weighted by fact count and priority
+    ws_weights: Dict[str, float] = {}
+    for ws in workstreams:
+        ws_id = ws["workstream_id"]
+        fact_count = len(ws_facts.get(ws_id, []))
+        priority = ws.get("priority", 1)
+        ws_weights[ws_id] = priority * (1 + min(fact_count, 10) * 0.5)
+    
+    total_weight = sum(ws_weights.values()) or 1.0
+    ws_minutes: Dict[str, int] = {}
+    for ws in workstreams:
+        ws_id = ws["workstream_id"]
+        allocated = max(10, int(duration_minutes * (ws_weights[ws_id] / total_weight)))
+        ws_minutes[ws_id] = allocated
+    
+    # Adjust to fit duration
+    total_allocated = sum(ws_minutes.values())
+    if total_allocated != duration_minutes and ws_minutes:
+        diff = duration_minutes - total_allocated
+        # Distribute diff to workstreams proportionally
+        sorted_ws = sorted(ws_minutes.keys(), key=lambda k: ws_minutes[k], reverse=True)
+        i = 0
+        while diff != 0 and sorted_ws:
+            ws_id = sorted_ws[i % len(sorted_ws)]
+            if diff > 0:
+                ws_minutes[ws_id] += 1
+                diff -= 1
+            elif ws_minutes[ws_id] > 10:
+                ws_minutes[ws_id] -= 1
+                diff += 1
+            else:
+                i += 1
+                if i >= len(sorted_ws) * 2:
+                    break
+            i += 1
+    
+    # Build section for each workstream
+    for ws in workstreams:
+        ws_id = ws["workstream_id"]
+        ws_title = ws.get("title", "")
+        ws_status = ws.get("status", "green")
+        ws_facts_list = ws_facts.get(ws_id, [])
+        
+        if not ws_facts_list:
+            # Empty workstream - add placeholder section
+            sections.append({
+                "title": ws_title,
+                "minutes": ws_minutes.get(ws_id, 10),
+                "items": [],
+                "workstream_id": ws_id,
+            })
+            continue
+        
+        # Categorize facts into subsections
+        goals: List[Dict[str, Any]] = []
+        decisions: List[Dict[str, Any]] = []
+        risks: List[Dict[str, Any]] = []
+        actions: List[Dict[str, Any]] = []
+        
+        for fact in ws_facts_list:
+            ftype = (fact.get("fact_type") or "").lower()
+            payload = fact.get("payload") or {}
+            evidence = fact.get("evidence") or []
+            
+            # Extract best quote for 'why'
+            why_quote = ""
+            if evidence:
+                for ev in evidence:
+                    q = ev.get("quote", "")
+                    if isinstance(q, str) and len(q.strip()) > 20:
+                        why_quote = q.strip()[:150]
+                        break
+            
+            # Build bullet text
+            text = _short_text_from_payload(payload) or ""
+            if not text and evidence:
+                text = why_quote[:80] if why_quote else ""
+            
+            if not text:
+                continue
+            
+            # Build why justification
+            why = ""
+            if why_quote:
+                if language == "pt-BR":
+                    why = f"(evidência: {why_quote[:100]}...)"
+                else:
+                    why = f"(evidence: {why_quote[:100]}...)"
+            
+            bullet = {
+                "text": text,
+                "why": why,
+                "owner": payload.get("owner"),
+                "due": fact.get("due_iso") or fact.get("due_at"),
+            }
+            
+            # Add ref
+            ref = {
+                "fact_id": fact.get("fact_id"),
+                "type": ftype,
+                "status": fact.get("status"),
+                "quote": why_quote,
+                "char_span": evidence[0].get("char_span") if evidence else None,
+                "workstream_id": ws_id,
+            }
+            all_refs.append(ref)
+            
+            # Categorize
+            if ftype in {"milestone", "objective", "metric"}:
+                goals.append(bullet)
+            elif ftype in {"decision", "decision_needed"}:
+                decisions.append(bullet)
+            elif ftype in {"risk", "blocker"}:
+                risks.append(bullet)
+            elif ftype in {"action_item", "task", "process_step"}:
+                actions.append(bullet)
+            else:
+                # Default to actions
+                actions.append(bullet)
+        
+        # Cap items per subsection to fit time budget
+        max_items_per = max(2, ws_minutes.get(ws_id, 10) // 5)
+        
+        section_items: List[Dict[str, Any]] = []
+        if goals:
+            section_items.append({
+                "heading": "Metas" if language == "pt-BR" else "Goals",
+                "bullets": goals[:max_items_per],
+            })
+        if decisions:
+            section_items.append({
+                "heading": "Decisões" if language == "pt-BR" else "Decisions",
+                "bullets": decisions[:max_items_per],
+            })
+        if risks:
+            section_items.append({
+                "heading": "Riscos" if language == "pt-BR" else "Risks",
+                "bullets": risks[:max_items_per],
+            })
+        if actions:
+            section_items.append({
+                "heading": "Ações" if language == "pt-BR" else "Actions",
+                "bullets": actions[:max_items_per],
+            })
+        
+        sections.append({
+            "title": ws_title,
+            "minutes": ws_minutes.get(ws_id, 10),
+            "items": section_items,
+            "workstream_id": ws_id,
+        })
+    
+    # Build title
+    if len(workstreams) == 1:
+        title = f"Reunião: {workstreams[0].get('title', '')}" if language == "pt-BR" else f"Meeting: {workstreams[0].get('title', '')}"
+    else:
+        org_name = db.get_org(org_id)
+        org_display = org_name["name"] if org_name else org_id
+        title = f"Top prioridades {org_display}" if language == "pt-BR" else f"Top priorities {org_display}"
+    
+    # Build metadata v2.0
+    metadata = {
+        "agenda_v": "2.0",
+        "workstreams": [
+            {
+                "workstream_id": ws["workstream_id"],
+                "title": ws.get("title", ""),
+                "status": ws.get("status", "green"),
+                "priority": ws.get("priority", 1),
+            }
+            for ws in workstreams
+        ],
+        "sections": sections,
+        "refs": all_refs,
+    }
+    
+    # Check for stale workstreams (not updated in 14 days)
+    from datetime import datetime, timedelta, timezone
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    stale_count = 0
+    for ws in workstreams:
+        updated_at = ws.get("updated_at")
+        if updated_at:
+            try:
+                updated = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                if (now - updated) > timedelta(days=14):
+                    stale_count += 1
+            except Exception:
+                pass
+    
+    if stale_count > 0:
+        metadata["health"] = "stale_macro"
+    
+    agenda = {
+        "title": title,
+        "minutes": duration_minutes,
+        "sections": sections,
+        "_metadata": metadata,
+    }
+    
+    return {
+        "agenda": agenda,
+        "choice": "macro",
+        "reason": "workstream-driven planning",
+        "subject": {"query": None, "coverage": 1.0 if sections else 0.0, "facts": len(facts)},
+        "supporting_fact_ids": [f.get("fact_id") for f in facts if f.get("fact_id")],
+    }
