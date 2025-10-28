@@ -1,5 +1,5 @@
 """
-Web search tool using Tavily API.
+Web search tool using the internal Deep Research Agent.
 
 This tool allows the meeting agent to search the web for current information
 about companies, topics, or any context needed for agenda planning.
@@ -15,7 +15,13 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+# --- PASSO 1: IMPORTAÇÃO ADICIONADA ---
+from agent.integrations.deepresearch_client import quick_research, DeepResearchError
+
+# ------------------------------------
+
 # Try to import httpx (async HTTP client)
+# (Este bloco não é mais usado pela ferramenta, mas pode ser mantido)
 try:
     import httpx
     HAVE_HTTPX = True
@@ -31,7 +37,7 @@ async def perform_web_search(
     days: int = 30,
 ) -> Dict[str, Any]:
     """
-    Perform web search using Tavily API.
+    Perform web search using Tavily API. (FUNÇÃO ANTIGA - NÃO UTILIZADA)
     
     Args:
         query: Search query (e.g., "BYD electric vehicles latest news")
@@ -91,7 +97,7 @@ async def perform_web_search(
                 headers={"Content-Type": "application/json"}
             )
             
-            if not response.is_success:
+        if not response.is_success:
                 error_text = response.text
                 logger.error(f"Tavily API error: {response.status_code} - {error_text}")
                 return {
@@ -102,7 +108,7 @@ async def perform_web_search(
                     "references": []
                 }
             
-            data = response.json()
+        data = response.json()
         
         # Format results
         results = data.get("results", [])
@@ -153,7 +159,7 @@ async def perform_web_search(
 
 
 def _format_search_results(query: str, answer: str, results: List[Dict]) -> str:
-    """Format search results into a summary for the LLM."""
+    """Format search results into a summary for the LLM. (FUNÇÃO ANTIGA - NÃO UTILIZADA)"""
     current_date = datetime.utcnow().strftime("%Y-%m-%d")
     
     formatted = f"=== WEB SEARCH RESULTS ===\n"
@@ -185,7 +191,7 @@ def _format_search_results(query: str, answer: str, results: List[Dict]) -> str:
 
 
 def _extract_references(results: List[Dict]) -> List[Dict[str, str]]:
-    """Extract clean references for citations."""
+    """Extract clean references for citations. (FUNÇÃO ANTIGA - NÃO UTILIZADA)"""
     references = []
     
     for i, result in enumerate(results, 1):
@@ -206,50 +212,51 @@ def _extract_references(results: List[Dict]) -> List[Dict[str, str]]:
     
     return references
 
-
+# --- PASSO 2: FUNÇÃO SUBSTITUÍDA ---
 def search_for_context(
     query: str,
-    max_results: int = 5,
-    recent_only: bool = True
+    **kwargs  # Captura argumentos extras (como max_results) que não usaremos
 ) -> str:
     """
-    Synchronous wrapper for web search (for non-async contexts).
-    
-    Returns formatted search summary as a string.
+    Wrapper síncrono para o Deep Research Client.
+    Retorna o relatório da pesquisa como uma string.
     """
-    import asyncio
-    
+    logger.info(f"Iniciando 'quick_research' (síncrona) para: {query}")
     try:
-        # Run async search in sync context
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # Chama diretamente a função do seu cliente
+        report = quick_research(
+            topic=query,
+            model_provider="gemini"  # Definindo 'gemini' como padrão
+        )
+        
+        if not report:
+             logger.warning(f"Pesquisa para '{query}' retornou um relatório vazio.")
+             return "A pesquisa foi bem-sucedida, mas não produziu um relatório."
+        
+        logger.info(f"Pesquisa para '{query}' concluída, retornando relatório.")
+        return report
+        
+    except DeepResearchError as e:
+        logger.error(f"Erro na 'quick_research' para '{query}': {e}")
+        return f"A pesquisa falhou com o erro: {e}"
     
-    days = 30 if recent_only else None
-    result = loop.run_until_complete(
-        perform_web_search(query, max_results=max_results, days=days)
-    )
-    
-    if result["success"]:
-        return result["formatted_summary"]
-    else:
-        return f"Web search failed: {result.get('error', 'Unknown error')}"
+    except Exception as e:
+        logger.error(f"Erro inesperado na 'quick_research' para '{query}': {e}")
+        return f"A pesquisa falhou com um erro inesperado: {e}"
 
-
-# LangChain Tool wrapper (if using LangChain tools)
+# --- PASSO 3: FERRAMENTA SUBSTITUÍDA ---
 try:
     from langchain.tools import Tool
     
     web_search_tool = Tool(
-        name="web_search",
+        name="deep_research",  # Nome mais claro
         description=(
-            "Search the web for current information about companies, topics, or events. "
-            "Use this when you need recent information not in the knowledge base. "
-            "Input should be a clear search query in English. "
-            "Returns: Current web search results with sources."
+            "Use esta ferramenta para realizar pesquisas aprofundadas sobre um tópico específico. "
+            "É ideal para quando você precisa de informações detalhadas, análises de mercado, "
+            "ou dados para embasar um planejamento estratégico para uma reunião. "
+            "Forneça apenas o tópico da pesquisa como entrada (query)."
         ),
-        func=search_for_context
+        func=search_for_context  # Continua usando a função que você acabou de modificar
     )
     
 except ImportError:
