@@ -14,10 +14,5 @@ else
     python -m agent.cli init-db --org "${DEFAULT_ORG_ID:-org_demo}"
 fi
 
-# Get port from environment (Azure Container Apps sets this automatically)
-PORT="${PORT:-8000}"
-echo "✓ Starting API server on port ${PORT}..."
-
-# Use exec to replace shell process with uvicorn (proper signal handling)
-# IMPORTANT: Do not use 'python -m agent.api' as it triggers __main__ block
-exec uvicorn agent.api:app --host 0.0.0.0 --port "${PORT}" --workers 1
+echo "✓ Starting API server on port ${PORT:-8000}..."
+exec uvicorn agent.api:app --host 0.0.0.0 --port "${PORT:-8000}"
